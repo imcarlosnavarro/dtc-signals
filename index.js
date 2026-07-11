@@ -3,10 +3,15 @@ const app = express();
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────
-const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;
-const CHANNEL_CFD     = process.env.CHANNEL_CFD;     // #⭕┃cfds-signals
-const CHANNEL_FUTURE  = process.env.CHANNEL_FUTURE;  // #⭕┃future-signals
-const SECRET_KEY      = process.env.SECRET_KEY || 'dtc2026';
+const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;
+const CHANNEL_CFD    = process.env.CHANNEL_CFD;
+const CHANNEL_FUTURE = process.env.CHANNEL_FUTURE;
+const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
+
+// ── Cooldown — evita spam de "posible señal" ─────────────────
+// Solo manda 1 posible señal por activo cada X minutos
+const COOLDOWN_MIN = 5; // minutos entre posibles señales
+const lastPossible = {}; // { "XAUUSD": timestamp, "MNQU26": timestamp }
 
 // ── Discord client ────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
@@ -19,25 +24,22 @@ client.once('ready', () => {
 client.login(DISCORD_TOKEN);
 
 // ── Colores embed ─────────────────────────────────────────────
-const COLOR_WARN  = 0xD4E600; // amarillo DTC
-const COLOR_LONG  = 0x00C853; // verde
-const COLOR_SHORT = 0xFF3B5C; // rojo
+const COLOR_WARN  = 0xD4E600;
+const COLOR_LONG  = 0x00C853;
+const COLOR_SHORT = 0xFF3B5C;
 
 // ═══════════════════════════════════════════════════════════════
-// POST /signal  — recibe alertas de TradingView
+// POST /signal
 // ═══════════════════════════════════════════════════════════════
 app.post('/signal', async (req, res) => {
   try {
-    // Verificar clave secreta
     if (req.query.key !== SECRET_KEY) {
-      console.log('❌ Clave inválida');
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
     const { type, asset, direction, entry, sl, tp, rr, score } = req.body;
     console.log(`📨 Señal: type=${type} asset=${asset} dir=${direction}`);
 
-    // Canal según activo
     const isFuture  = asset === 'MNQU26' || asset === 'MNQ';
     const channelId = isFuture ? CHANNEL_FUTURE : CHANNEL_CFD;
     const channel   = await client.channels.fetch(channelId);
@@ -46,8 +48,19 @@ app.post('/signal', async (req, res) => {
       return res.status(500).json({ error: 'Canal no encontrado' });
     }
 
-    // ── POSIBLE SEÑAL ────────────────────────────────────────
+    // ── POSIBLE SEÑAL — con cooldown ─────────────────────────
     if (type === 'possible') {
+      const now      = Date.now();
+      const lastTime = lastPossible[asset] || 0;
+      const diffMin  = (now - lastTime) / 1000 / 60;
+
+      if (diffMin < COOLDOWN_MIN) {
+        console.log(`⏳ Cooldown activo para ${asset} — faltan ${(COOLDOWN_MIN - diffMin).toFixed(1)} min`);
+        return res.status(200).json({ ok: true, skipped: true, reason: 'cooldown' });
+      }
+
+      lastPossible[asset] = now;
+
       await channel.send({
         embeds: [{
           color: COLOR_WARN,
@@ -61,11 +74,15 @@ app.post('/signal', async (req, res) => {
 
     // ── SEÑAL CONFIRMADA ─────────────────────────────────────
     else if (type === 'confirmed') {
+      // Reset cooldown al confirmar — permite nueva posible en el siguiente setup
+      lastPossible[asset] = 0;
+
       const isLong = direction === 'LONG';
       const color  = isLong ? COLOR_LONG : COLOR_SHORT;
+      const arrow  = isLong ? '📈' : '📉';
 
       const lines = [
-        `## ✅ SEÑAL CONFIRMADA — ${asset} ${direction}`,
+        `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,
         ``,
         `🎯 **Entrada:** \`${entry}\``,
         `🛑 **Stop Loss:** \`${sl}\``,
@@ -79,11 +96,11 @@ app.post('/signal', async (req, res) => {
         embeds: [{
           color,
           description: lines.join('\n'),
-          footer: { text: 'Despierta Tu Capital (DTC) · Esto no es consejo de inversión' },
+          footer: { text: 'DTC · Esto no es consejo de inversión' },
           timestamp: new Date().toISOString(),
         }]
       });
-      console.log(`✅ Señal confirmada enviada → ${asset} ${direction}`);
+      console.log(`✅ Señal confirmada → ${asset} ${direction} entrada:${entry}`);
     }
 
     res.status(200).json({ ok: true });
@@ -98,13 +115,11 @@ app.post('/signal', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ DTC Signals Bot running',
-    endpoints: {
-      signal: 'POST /signal?key=TU_CLAVE'
-    }
+    cooldown_min: COOLDOWN_MIN,
+    last_possible: lastPossible,
   });
 });
 
-// ── Puerto ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 DTC Signals escuchando en puerto ${PORT}`);
