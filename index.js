@@ -14,13 +14,11 @@ const lastPossible = {};
 const activeTrades = {};
 let tradeCounter = 0;
 
-const stats = {
-  total:0, wins:0, losses:0,
-  tp1Hits:0, tp2Hits:0, tp3Hits:0, slHits:0,
-  pnlR:0, history:[],
-  weeklyStats: { total:0, wins:0, losses:0, pnlR:0 },
-  weeklyStart: new Date().toISOString()
-};
+function emptyStats() {
+  return { total:0, wins:0, losses:0, tp1Hits:0, tp2Hits:0, tp3Hits:0, slHits:0, pnlR:0, history:[], weeklyStats:{total:0,wins:0,losses:0,pnlR:0}, weeklyStart:new Date().toISOString() };
+}
+const stats = { XAUUSD: emptyStats(), MNQU26: emptyStats() };
+function getStats(asset) { return stats[asset] || stats['XAUUSD']; }
 
 // ── Google Sheets ─────────────────────────────────────────────
 const { google } = require('googleapis');
@@ -91,10 +89,11 @@ async function getCurrentPrice(asset) {
 
 // ── Registrar resultado ───────────────────────────────────────
 async function recordResult(trade, result, rPnl) {
-  stats.total++; stats.weeklyStats.total++;
-  if (result==='WIN')  { stats.wins++;   stats.weeklyStats.wins++; }
-  if (result==='LOSS') { stats.losses++; stats.weeklyStats.losses++; }
-  stats.pnlR += rPnl; stats.weeklyStats.pnlR += rPnl;
+  const s = getStats(trade.asset);
+  s.total++; s.weeklyStats.total++;
+  if (result==='WIN')  { s.wins++;   s.weeklyStats.wins++; }
+  if (result==='LOSS') { s.losses++; s.weeklyStats.losses++; }
+  s.pnlR += rPnl; s.weeklyStats.pnlR += rPnl;
 
   const entry = {
     date: new Date().toLocaleDateString('es-ES'),
@@ -102,8 +101,8 @@ async function recordResult(trade, result, rPnl) {
     result, rPnl: rPnl.toFixed(2),
     tp1: trade.tp1Hit, tp2: trade.tp2Hit, tp3: trade.tp3Hit
   };
-  stats.history.unshift(entry);
-  if (stats.history.length > 50) stats.history.pop();
+  s.history.unshift(entry);
+  if (s.history.length > 50) s.history.pop();
 
   // Escribir en Google Sheets
   const now = new Date();
@@ -147,7 +146,7 @@ function startPriceMonitor() {
 
         // SL
         if (!trade.slHit && (isLong ? price <= trade.sl : price >= trade.sl)) {
-          trade.slHit = true; stats.slHits++;
+          trade.slHit = true; getStats(trade.asset).slHits++;
           await channel.send({ embeds: [{
             color: COLOR_SL,
             description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida. −1R*\n*— Despierta Tu Capital (DTC)*`,
@@ -159,7 +158,7 @@ function startPriceMonitor() {
 
         // TP1
         if (!trade.tp1Hit && trade.tp1 && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
-          trade.tp1Hit = true; stats.tp1Hits++;
+          trade.tp1Hit = true; getStats(trade.asset).tp1Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP1,
             description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:0.75)*\n\n✅ *Cierra parcial o mueve SL a Break Even.*\n*— Despierta Tu Capital (DTC)*`,
@@ -169,7 +168,7 @@ function startPriceMonitor() {
 
         // TP2
         if (trade.tp1Hit && !trade.tp2Hit && trade.tp2 && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
-          trade.tp2Hit = true; stats.tp2Hits++;
+          trade.tp2Hit = true; getStats(trade.asset).tp2Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP2,
             description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
@@ -179,7 +178,7 @@ function startPriceMonitor() {
 
         // TP3
         if (trade.tp2Hit && !trade.tp3Hit && trade.tp3 && (isLong ? price >= trade.tp3 : price <= trade.tp3)) {
-          trade.tp3Hit = true; stats.tp3Hits++;
+          trade.tp3Hit = true; getStats(trade.asset).tp3Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP3,
             description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP3:** \`${trade.tp3}\`\n\n🎯 *Objetivo final completado.*\n*— Despierta Tu Capital (DTC)*`,
@@ -205,29 +204,33 @@ function scheduleWeeklyReport() {
 
 async function sendWeeklyReport() {
   try {
-    const s = stats.weeklyStats;
-    const wr = s.total>0 ? Math.round(s.wins/s.total*100) : 0;
-    const pnl = s.pnlR>=0 ? `+${s.pnlR.toFixed(2)}R` : `${s.pnlR.toFixed(2)}R`;
-    const desc = [
-      `## 📊 RESUMEN SEMANAL — DTC SIGNALS`,``,
-      `**Señales totales:** ${s.total}`,
-      `**Ganadoras:** ${s.wins}  |  **Perdedoras:** ${s.losses}`,
-      `**Win Rate:** ${wr}%`,
-      `**PnL:** \`${pnl}\``,``,
-      `🟢 TP1 tocados: ${stats.tp1Hits}`,
-      `🟡 TP2 tocados: ${stats.tp2Hits}`,
-      `🏆 TP3 tocados: ${stats.tp3Hits}`,
-      `🛑 SL tocados: ${stats.slHits}`,``,
-      `*— Despierta Tu Capital (DTC)*`
-    ].join('\n');
-
-    for (const chId of [CHANNEL_CFD, CHANNEL_FUTURE]) {
+    const pairs = [
+      { asset:'XAUUSD', chId:CHANNEL_CFD,    emoji:'🥇' },
+      { asset:'MNQU26', chId:CHANNEL_FUTURE,  emoji:'📈' }
+    ];
+    for (const { asset, chId, emoji } of pairs) {
+      const s = getStats(asset).weeklyStats;
+      const st = getStats(asset);
+      const wr  = s.total>0 ? Math.round(s.wins/s.total*100) : 0;
+      const pnl = s.pnlR>=0 ? `+${s.pnlR.toFixed(2)}R` : `${s.pnlR.toFixed(2)}R`;
+      const desc = [
+        `## 📊 RESUMEN SEMANAL — ${emoji} ${asset}`,``,
+        `**Señales totales:** ${s.total}`,
+        `**Ganadoras:** ${s.wins}  |  **Perdedoras:** ${s.losses}`,
+        `**Win Rate:** ${wr}%`,
+        `**PnL semana:** \`${pnl}\``,``,
+        `🟢 TP1 tocados: ${st.tp1Hits}`,
+        `🟡 TP2 tocados: ${st.tp2Hits}`,
+        `🏆 TP3 tocados: ${st.tp3Hits}`,
+        `🛑 SL tocados: ${st.slHits}`,``,
+        `*— Despierta Tu Capital (DTC)*`
+      ].join('\n');
       const ch = await client.channels.fetch(chId).catch(()=>null);
       if (ch) await ch.send({ embeds: [{ color:COLOR_STATS, description:desc,
         footer:{text:'DTC · Resultados semanales'}, timestamp:new Date().toISOString() }]});
+      getStats(asset).weeklyStats = { total:0, wins:0, losses:0, pnlR:0 };
+      getStats(asset).weeklyStart = new Date().toISOString();
     }
-    stats.weeklyStats = { total:0, wins:0, losses:0, pnlR:0 };
-    stats.weeklyStart = new Date().toISOString();
     console.log('✅ Resumen semanal enviado');
   } catch(e) { console.error('Weekly error:', e.message); }
 }
@@ -320,16 +323,22 @@ app.post('/signal', async (req, res) => {
 
 // ── GET /stats ────────────────────────────────────────────────
 app.get('/stats', (req, res) => {
-  const wr  = stats.total>0 ? (stats.wins/stats.total*100).toFixed(1):'0.0';
-  const wrW = stats.weeklyStats.total>0 ? (stats.weeklyStats.wins/stats.weeklyStats.total*100).toFixed(1):'0.0';
+  const fmt = (s) => {
+    const wr  = s.total>0 ? (s.wins/s.total*100).toFixed(1):'0.0';
+    const wrW = s.weeklyStats.total>0 ? (s.weeklyStats.wins/s.weeklyStats.total*100).toFixed(1):'0.0';
+    return {
+      total:s.total, wins:s.wins, losses:s.losses,
+      win_rate:wr+'%', pnl_r:s.pnlR.toFixed(2)+'R',
+      tp1_hits:s.tp1Hits, tp2_hits:s.tp2Hits,
+      tp3_hits:s.tp3Hits, sl_hits:s.slHits,
+      this_week:{ ...s.weeklyStats, win_rate:wrW+'%' },
+      last_10:s.history.slice(0,10)
+    };
+  };
   res.json({
-    total:stats.total, wins:stats.wins, losses:stats.losses,
-    win_rate:wr+'%', pnl_r:stats.pnlR.toFixed(2)+'R',
-    tp1_hits:stats.tp1Hits, tp2_hits:stats.tp2Hits,
-    tp3_hits:stats.tp3Hits, sl_hits:stats.slHits,
-    this_week:{ ...stats.weeklyStats, win_rate:wrW+'%' },
-    active_trades:Object.keys(activeTrades).length,
-    last_10:stats.history.slice(0,10)
+    active_trades: Object.keys(activeTrades).length,
+    XAUUSD: fmt(stats.XAUUSD),
+    MNQU26: fmt(stats.MNQU26)
   });
 });
 
