@@ -6,40 +6,70 @@ const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;
 const CHANNEL_CFD    = process.env.CHANNEL_CFD;
 const CHANNEL_FUTURE = process.env.CHANNEL_FUTURE;
 const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
+const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
+const SHEET_ID       = process.env.SHEET_ID;
 
 const COOLDOWN_MIN = 5;
 const lastPossible = {};
-
-// ── Operaciones activas en memoria ───────────────────────────
-// { id, asset, direction, entry, sl, tp1, tp2, tp3, tp1Hit, tp2Hit, tp3Hit, slHit, channelId, openTime }
 const activeTrades = {};
 let tradeCounter = 0;
 
+const stats = {
+  total:0, wins:0, losses:0,
+  tp1Hits:0, tp2Hits:0, tp3Hits:0, slHits:0,
+  pnlR:0, history:[],
+  weeklyStats: { total:0, wins:0, losses:0, pnlR:0 },
+  weeklyStart: new Date().toISOString()
+};
+
+// ── Google Sheets ─────────────────────────────────────────────
+const { google } = require('googleapis');
+
+async function getSheetsClient() {
+  const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  });
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function appendToSheet(row) {
+  try {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Sheet1!A:N',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [row] }
+    });
+    console.log('✅ Fila añadida a Google Sheets');
+  } catch(e) {
+    console.error('❌ Sheets error:', e.message);
+  }
+}
+
+// ── Discord ──────────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.once('ready', () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
   startPriceMonitor();
+  scheduleWeeklyReport();
 });
 client.login(DISCORD_TOKEN);
 
-const COLOR_WARN  = 0xD4E600;
-const COLOR_LONG  = 0x00C853;
-const COLOR_SHORT = 0xFF3B5C;
-const COLOR_SL    = 0xFF0000;
-const COLOR_TP1   = 0x00E676;
-const COLOR_TP2   = 0x00C853;
-const COLOR_TP3   = 0xFFD700;
+const COLOR_WARN=0xD4E600, COLOR_LONG=0x00C853, COLOR_SHORT=0xFF3B5C;
+const COLOR_SL=0xFF0000, COLOR_TP1=0x00E676, COLOR_TP2=0x00C853;
+const COLOR_TP3=0xFFD700, COLOR_STATS=0x00BFFF;
 
-// ── Obtener precio actual via API gratuita ────────────────────
+// ── Precio actual ─────────────────────────────────────────────
 async function getCurrentPrice(asset) {
   try {
     const https = require('https');
     return new Promise((resolve, reject) => {
-      // Twelve Data API — gratuita, no necesita key para algunos símbolos
-      const symbol = asset === 'XAUUSD' ? 'XAU/USD' : 'NAS100/USD';
-      const apiKey = process.env.TWELVE_API_KEY || 'demo';
-      const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`;
+      const symbol = asset === 'XAUUSD' ? 'XAU/USD' : 'NDX';
+      const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=${TWELVE_KEY}`;
       https.get(url, (res) => {
         let data = '';
         res.on('data', d => data += d);
@@ -47,112 +77,159 @@ async function getCurrentPrice(asset) {
           try {
             const json = JSON.parse(data);
             const price = parseFloat(json.price);
-            if (!isNaN(price)) resolve(price);
+            if (!isNaN(price)) { console.log(`💰 ${asset}: ${price}`); resolve(price); }
             else reject(new Error('No price: ' + data));
           } catch(e) { reject(e); }
         });
       }).on('error', reject);
     });
   } catch(e) {
-    console.error('Price fetch error:', e.message);
+    console.error('Price error:', e.message);
     return null;
   }
 }
 
-// ── Monitor de precios cada 60 segundos ──────────────────────
+// ── Registrar resultado ───────────────────────────────────────
+async function recordResult(trade, result, rPnl) {
+  stats.total++; stats.weeklyStats.total++;
+  if (result==='WIN')  { stats.wins++;   stats.weeklyStats.wins++; }
+  if (result==='LOSS') { stats.losses++; stats.weeklyStats.losses++; }
+  stats.pnlR += rPnl; stats.weeklyStats.pnlR += rPnl;
+
+  const entry = {
+    date: new Date().toLocaleDateString('es-ES'),
+    asset: trade.asset, direction: trade.direction,
+    result, rPnl: rPnl.toFixed(2),
+    tp1: trade.tp1Hit, tp2: trade.tp2Hit, tp3: trade.tp3Hit
+  };
+  stats.history.unshift(entry);
+  if (stats.history.length > 50) stats.history.pop();
+
+  // Escribir en Google Sheets
+  const now = new Date();
+  const row = [
+    now.toLocaleDateString('es-ES'),
+    trade.asset,
+    trade.direction,
+    trade.entry,
+    trade.sl || '',
+    trade.tp1 || '',
+    trade.tp2 || '',
+    trade.tp3 || '',
+    result,
+    trade.tp1Hit ? 'SI' : 'NO',
+    trade.tp2Hit ? 'SI' : 'NO',
+    trade.tp3Hit ? 'SI' : 'NO',
+    rPnl.toFixed(2),
+    trade.score || ''
+  ];
+  await appendToSheet(row);
+}
+
+// ── Monitor de precios ────────────────────────────────────────
 function startPriceMonitor() {
   setInterval(async () => {
-    const tradeIds = Object.keys(activeTrades);
-    if (tradeIds.length === 0) return;
+    const ids = Object.keys(activeTrades);
+    if (ids.length === 0) return;
+    console.log(`🔍 Monitorizando ${ids.length} trades...`);
 
-    console.log(`🔍 Monitorizando ${tradeIds.length} operaciones activas...`);
-
-    // Agrupar por asset para no hacer múltiples llamadas
-    const assets = [...new Set(tradeIds.map(id => activeTrades[id].asset))];
-
+    const assets = [...new Set(ids.map(id => activeTrades[id].asset))];
     for (const asset of assets) {
       const price = await getCurrentPrice(asset);
       if (!price) continue;
-      console.log(`💰 Precio ${asset}: ${price}`);
 
-      // Revisar cada trade de ese asset
-      for (const id of tradeIds) {
+      for (const id of [...ids]) {
         const trade = activeTrades[id];
-        if (trade.asset !== asset) continue;
-
+        if (!trade || trade.asset !== asset) continue;
         const isLong = trade.direction === 'LONG';
         const channel = await client.channels.fetch(trade.channelId).catch(() => null);
         if (!channel) continue;
 
-        // Comprobar SL
-        if (!trade.slHit) {
-          const slHit = isLong ? price <= trade.sl : price >= trade.sl;
-          if (slHit) {
-            trade.slHit = true;
-            await channel.send({
-              embeds: [{
-                color: COLOR_SL,
-                description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida.*\n*— Despierta Tu Capital (DTC)*`,
-                footer: { text: 'DTC · Gestión de riesgo activa' },
-                timestamp: new Date().toISOString(),
-              }]
-            });
-            delete activeTrades[id];
-            continue;
-          }
+        // SL
+        if (!trade.slHit && (isLong ? price <= trade.sl : price >= trade.sl)) {
+          trade.slHit = true; stats.slHits++;
+          await channel.send({ embeds: [{
+            color: COLOR_SL,
+            description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida. −1R*\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Gestión de riesgo' }, timestamp: new Date().toISOString()
+          }]});
+          await recordResult(trade, 'LOSS', -1);
+          delete activeTrades[id]; continue;
         }
 
-        // Comprobar TP1
-        if (!trade.tp1Hit && trade.tp1) {
-          const tp1Hit = isLong ? price >= trade.tp1 : price <= trade.tp1;
-          if (tp1Hit) {
-            trade.tp1Hit = true;
-            await channel.send({
-              embeds: [{
-                color: COLOR_TP1,
-                description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:0.75)*\n\n✅ *Cierra parcial o mueve SL a BE.*\n*— Despierta Tu Capital (DTC)*`,
-                footer: { text: 'DTC · Gestión de posición' },
-                timestamp: new Date().toISOString(),
-              }]
-            });
-          }
+        // TP1
+        if (!trade.tp1Hit && trade.tp1 && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
+          trade.tp1Hit = true; stats.tp1Hits++;
+          await channel.send({ embeds: [{
+            color: COLOR_TP1,
+            description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:0.75)*\n\n✅ *Cierra parcial o mueve SL a Break Even.*\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+          }]});
         }
 
-        // Comprobar TP2
-        if (trade.tp1Hit && !trade.tp2Hit && trade.tp2) {
-          const tp2Hit = isLong ? price >= trade.tp2 : price <= trade.tp2;
-          if (tp2Hit) {
-            trade.tp2Hit = true;
-            await channel.send({
-              embeds: [{
-                color: COLOR_TP2,
-                description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
-                footer: { text: 'DTC · Gestión de posición' },
-                timestamp: new Date().toISOString(),
-              }]
-            });
-          }
+        // TP2
+        if (trade.tp1Hit && !trade.tp2Hit && trade.tp2 && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
+          trade.tp2Hit = true; stats.tp2Hits++;
+          await channel.send({ embeds: [{
+            color: COLOR_TP2,
+            description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+          }]});
         }
 
-        // Comprobar TP3
-        if (trade.tp2Hit && !trade.tp3Hit && trade.tp3) {
-          const tp3Hit = isLong ? price >= trade.tp3 : price <= trade.tp3;
-          if (tp3Hit) {
-            trade.tp3Hit = true;
-            await channel.send({
-              embeds: [{
-                color: COLOR_TP3,
-                description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP3:** \`${trade.tp3}\`\n\n🎯 *Objetivo final completado. Operación cerrada.*\n*— Despierta Tu Capital (DTC)*`,
-                footer: { text: 'DTC · Objetivo completado' },
-                timestamp: new Date().toISOString(),
-              }]
-            });
-            delete activeTrades[id];
-          }
+        // TP3
+        if (trade.tp2Hit && !trade.tp3Hit && trade.tp3 && (isLong ? price >= trade.tp3 : price <= trade.tp3)) {
+          trade.tp3Hit = true; stats.tp3Hits++;
+          await channel.send({ embeds: [{
+            color: COLOR_TP3,
+            description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP3:** \`${trade.tp3}\`\n\n🎯 *Objetivo final completado.*\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Objetivo completado' }, timestamp: new Date().toISOString()
+          }]});
+          await recordResult(trade, 'WIN', trade.tp1Hit && trade.tp2Hit ? 2.74 : 1.75);
+          delete activeTrades[id];
         }
       }
     }
-  }, 60000); // cada 60 segundos
+  }, 60000);
+}
+
+// ── Resumen semanal ───────────────────────────────────────────
+function scheduleWeeklyReport() {
+  setInterval(async () => {
+    const now = new Date();
+    if (now.getDay()===1 && now.getHours()===8 && now.getMinutes()<1) {
+      await sendWeeklyReport();
+    }
+  }, 60000);
+}
+
+async function sendWeeklyReport() {
+  try {
+    const s = stats.weeklyStats;
+    const wr = s.total>0 ? Math.round(s.wins/s.total*100) : 0;
+    const pnl = s.pnlR>=0 ? `+${s.pnlR.toFixed(2)}R` : `${s.pnlR.toFixed(2)}R`;
+    const desc = [
+      `## 📊 RESUMEN SEMANAL — DTC SIGNALS`,``,
+      `**Señales totales:** ${s.total}`,
+      `**Ganadoras:** ${s.wins}  |  **Perdedoras:** ${s.losses}`,
+      `**Win Rate:** ${wr}%`,
+      `**PnL:** \`${pnl}\``,``,
+      `🟢 TP1 tocados: ${stats.tp1Hits}`,
+      `🟡 TP2 tocados: ${stats.tp2Hits}`,
+      `🏆 TP3 tocados: ${stats.tp3Hits}`,
+      `🛑 SL tocados: ${stats.slHits}`,``,
+      `*— Despierta Tu Capital (DTC)*`
+    ].join('\n');
+
+    for (const chId of [CHANNEL_CFD, CHANNEL_FUTURE]) {
+      const ch = await client.channels.fetch(chId).catch(()=>null);
+      if (ch) await ch.send({ embeds: [{ color:COLOR_STATS, description:desc,
+        footer:{text:'DTC · Resultados semanales'}, timestamp:new Date().toISOString() }]});
+    }
+    stats.weeklyStats = { total:0, wins:0, losses:0, pnlR:0 };
+    stats.weeklyStart = new Date().toISOString();
+    console.log('✅ Resumen semanal enviado');
+  } catch(e) { console.error('Weekly error:', e.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -160,124 +237,113 @@ function startPriceMonitor() {
 // ═══════════════════════════════════════════════════════════════
 app.post('/signal', async (req, res) => {
   try {
-    if (req.query.key !== SECRET_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (req.query.key !== SECRET_KEY) return res.status(401).json({ error: 'Unauthorized' });
 
     const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr } = req.body;
     console.log(`📨 ${type} | ${asset} | ${direction}`);
 
-    const isFuture  = asset === 'MNQU26' || asset === 'MNQ';
+    const isFuture  = asset==='MNQU26'||asset==='MNQ';
     const channelId = isFuture ? CHANNEL_FUTURE : CHANNEL_CFD;
     const channel   = await client.channels.fetch(channelId);
     if (!channel) return res.status(500).json({ error: 'Canal no encontrado' });
 
-    // ── POSIBLE ───────────────────────────────────────────────
     if (type === 'possible') {
-      const now     = Date.now();
-      const lastT   = lastPossible[asset] || 0;
-      const diffMin = (now - lastT) / 60000;
-      if (diffMin < COOLDOWN_MIN) {
-        return res.status(200).json({ ok: true, skipped: true });
-      }
+      const now = Date.now();
+      if ((now-(lastPossible[asset]||0))/60000 < COOLDOWN_MIN)
+        return res.status(200).json({ ok:true, skipped:true });
       lastPossible[asset] = now;
-      const dirTxt = direction ? ` ${direction}` : '';
-      await channel.send({
-        embeds: [{
-          color: COLOR_WARN,
-          description: `## ⚠️ POSIBLE SEÑAL — ${asset}${dirTxt}\n\nEsperando confirmación... no te precipites !!!`,
-          footer: { text: 'Despierta Tu Capital (DTC)' },
-          timestamp: new Date().toISOString(),
-        }]
-      });
+      await channel.send({ embeds: [{
+        color: COLOR_WARN,
+        description: `## ⚠️ POSIBLE SEÑAL — ${asset}${direction?' '+direction:''}\n\nEsperando confirmación... no te precipites !!!`,
+        footer:{text:'Despierta Tu Capital (DTC)'}, timestamp:new Date().toISOString()
+      }]});
     }
 
-    // ── CONFIRMADA ────────────────────────────────────────────
     else if (type === 'confirmed') {
       lastPossible[asset] = 0;
-      const isLong = direction === 'LONG';
+      const isLong = direction==='LONG';
       const color  = isLong ? COLOR_LONG : COLOR_SHORT;
       const arrow  = isLong ? '📈' : '📉';
 
-      // Resolver niveles
-      let slFinal  = sl  && sl  !== 'undefined' ? parseFloat(sl)  : null;
-      let tp1Final = tp1 && tp1 !== 'undefined' ? parseFloat(tp1) : (tp && tp !== 'undefined' ? parseFloat(tp) : null);
-      let tp2Final = tp2 && tp2 !== 'undefined' ? parseFloat(tp2) : null;
-      let tp3Final = tp3 && tp3 !== 'undefined' ? parseFloat(tp3) : null;
+      let slF  = sl  && sl !=='undefined' ? parseFloat(sl)  : null;
+      let tp1F = tp1 && tp1!=='undefined' ? parseFloat(tp1) : (tp&&tp!=='undefined'?parseFloat(tp):null);
+      let tp2F = tp2 && tp2!=='undefined' ? parseFloat(tp2) : null;
+      let tp3F = tp3 && tp3!=='undefined' ? parseFloat(tp3) : null;
 
       if (atr && entry) {
-        const atrV = parseFloat(atr);
-        const entV = parseFloat(entry);
-        const slM  = isFuture ? 1.0 : 1.5;
-        const tp1M = isFuture ? 0.75 : 1.125;
-        const tp2M = isFuture ? 1.25 : 2.625;
-        const tp3M = isFuture ? 1.8  : 4.1;
-        if (!slFinal)  slFinal  = isLong ? entV - atrV*slM  : entV + atrV*slM;
-        if (!tp1Final) tp1Final = isLong ? entV + atrV*tp1M : entV - atrV*tp1M;
-        if (!tp2Final) tp2Final = isLong ? entV + atrV*tp2M : entV - atrV*tp2M;
-        if (!tp3Final) tp3Final = isLong ? entV + atrV*tp3M : entV - atrV*tp3M;
+        const atrV=parseFloat(atr), entV=parseFloat(entry);
+        const slM=isFuture?1.0:1.5, t1=isFuture?0.75:1.125, t2=isFuture?1.25:2.625, t3=isFuture?1.8:4.1;
+        if (!slF)  slF  = isLong ? entV-atrV*slM : entV+atrV*slM;
+        if (!tp1F) tp1F = isLong ? entV+atrV*t1  : entV-atrV*t1;
+        if (!tp2F) tp2F = isLong ? entV+atrV*t2  : entV-atrV*t2;
+        if (!tp3F) tp3F = isLong ? entV+atrV*t3  : entV-atrV*t3;
       }
 
-      const rr1F = rr1 || '0.75';
-      const rr2F = rr2 || (isFuture ? '1.25' : '1.75');
-      const rr3F = rr3 || rr || (isFuture ? '1.8' : '2.74');
+      const r=(v)=>v?Math.round(v*100)/100:null;
+      const rr1F=rr1||'0.75', rr2F=rr2||(isFuture?'1.25':'1.75'), rr3F=rr3||rr||(isFuture?'1.8':'2.74');
 
       const lines = [
-        `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,
-        ``,
+        `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,``,
         `🎯 **Entrada:** \`${entry}\``,
-        slFinal  ? `🛑 **Stop Loss:** \`${Math.round(slFinal*100)/100}\`` : null,
-        ``,
-        tp1Final ? `🟢 **TP1:** \`${Math.round(tp1Final*100)/100}\`  *(RR 1:${rr1F})*` : null,
-        tp2Final ? `🟡 **TP2:** \`${Math.round(tp2Final*100)/100}\`  *(RR 1:${rr2F})*` : null,
-        tp3Final ? `🏆 **TP3:** \`${Math.round(tp3Final*100)/100}\`  *(RR 1:${rr3F})*` : null,
-        score    ? `\n⭐ **Score:** \`${score}/10\`` : null,
+        slF  ? `🛑 **Stop Loss:** \`${r(slF)}\`` : null,``,
+        tp1F ? `🟢 **TP1:** \`${r(tp1F)}\`  *(RR 1:${rr1F})*` : null,
+        tp2F ? `🟡 **TP2:** \`${r(tp2F)}\`  *(RR 1:${rr2F})*` : null,
+        tp3F ? `🏆 **TP3:** \`${r(tp3F)}\`  *(RR 1:${rr3F})*` : null,
+        score ? `\n⭐ **Score:** \`${score}/10\`` : null,
       ].filter(Boolean);
 
-      if (isFuture) lines.push(``, `> ⚠️ *Precio en NAS100. En MNQU26 suma ~350 pts.*`);
-      lines.push(``, `*— Despierta Tu Capital (DTC)*`);
+      if (isFuture) lines.push(``,`> ⚠️ *Precio en NAS100. En MNQU26 suma ~350 pts.*`);
+      lines.push(``,`*— Despierta Tu Capital (DTC)*`);
 
-      await channel.send({
-        embeds: [{
-          color,
-          description: lines.join('\n'),
-          footer: { text: 'DTC · Esto no es consejo de inversión' },
-          timestamp: new Date().toISOString(),
-        }]
-      });
+      await channel.send({ embeds: [{ color, description:lines.join('\n'),
+        footer:{text:'DTC · Esto no es consejo de inversión'}, timestamp:new Date().toISOString() }]});
 
-      // Guardar trade activo para monitorizar
-      if (slFinal || tp1Final) {
+      if (slF || tp1F) {
         const id = `trade_${++tradeCounter}`;
         activeTrades[id] = {
-          id, asset, direction,
-          entry: parseFloat(entry),
-          sl: slFinal,
-          tp1: tp1Final, tp2: tp2Final, tp3: tp3Final,
-          tp1Hit: false, tp2Hit: false, tp3Hit: false, slHit: false,
-          channelId,
-          openTime: new Date().toISOString()
+          id, asset, direction, entry:parseFloat(entry),
+          sl:slF, tp1:tp1F, tp2:tp2F, tp3:tp3F,
+          tp1Hit:false, tp2Hit:false, tp3Hit:false, slHit:false,
+          channelId, score: score||'', openTime:new Date().toISOString()
         };
-        console.log(`📋 Trade activo guardado: ${id} | ${asset} ${direction}`);
+        console.log(`📋 Trade guardado: ${id} | ${asset} ${direction}`);
       }
     }
 
-    res.status(200).json({ ok: true, activeTrades: Object.keys(activeTrades).length });
+    res.status(200).json({ ok:true, active_trades:Object.keys(activeTrades).length });
 
-  } catch (err) {
+  } catch(err) {
     console.error('❌ Error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error:err.message });
   }
 });
 
-// ── Health check ──────────────────────────────────────────────
-app.get('/', (req, res) => {
+// ── GET /stats ────────────────────────────────────────────────
+app.get('/stats', (req, res) => {
+  const wr  = stats.total>0 ? (stats.wins/stats.total*100).toFixed(1):'0.0';
+  const wrW = stats.weeklyStats.total>0 ? (stats.weeklyStats.wins/stats.weeklyStats.total*100).toFixed(1):'0.0';
   res.json({
-    status: '✅ DTC Signals Bot running',
-    cooldown_min: COOLDOWN_MIN,
-    active_trades: Object.keys(activeTrades).length,
-    trades: activeTrades
+    total:stats.total, wins:stats.wins, losses:stats.losses,
+    win_rate:wr+'%', pnl_r:stats.pnlR.toFixed(2)+'R',
+    tp1_hits:stats.tp1Hits, tp2_hits:stats.tp2Hits,
+    tp3_hits:stats.tp3Hits, sl_hits:stats.slHits,
+    this_week:{ ...stats.weeklyStats, win_rate:wrW+'%' },
+    active_trades:Object.keys(activeTrades).length,
+    last_10:stats.history.slice(0,10)
   });
+});
+
+app.get('/', (req,res) => res.json({
+  status:'✅ DTC Signals Bot running',
+  cooldown_min:COOLDOWN_MIN,
+  active_trades:Object.keys(activeTrades).length,
+  stats_url:'/stats'
+}));
+
+app.post('/weekly', async (req,res) => {
+  if (req.query.key!==SECRET_KEY) return res.status(401).json({error:'Unauthorized'});
+  await sendWeeklyReport();
+  res.json({ok:true});
 });
 
 const PORT = process.env.PORT || 3000;
