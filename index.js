@@ -9,16 +9,6 @@ const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
 const SHEET_ID       = process.env.SHEET_ID;
 
-// ── Pestañas del Google Sheet por activo ────────────────────
-// Cada activo escribe/lee en su propia pestaña en vez de compartir "Hoja 1"
-const SHEET_TABS = {
-  XAUUSD: 'XAUUSD',
-  MNQU26: 'MNQ - NAS100'
-};
-function tabFor(asset) {
-  return SHEET_TABS[asset] || 'Hoja 1';
-}
-
 const COOLDOWN_MIN = 5;
 const lastPossible = {};
 const activeTrades = {};
@@ -42,11 +32,51 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
+// ── Detección automática de pestaña por activo ──────────────────
+// En vez de exigir un nombre exacto (frágil: espacios, guiones, tildes...),
+// se listan las pestañas reales del Sheet y se elige la que mejor coincide
+// con palabras clave del activo. Se cachea 5 minutos para no golpear la API.
+let tabsCache = { list: null, at: 0 };
+
+async function getSheetTitles() {
+  const now = Date.now();
+  if (tabsCache.list && (now - tabsCache.at) < 5 * 60 * 1000) return tabsCache.list;
+  const sheets = await getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const titles = (meta.data.sheets || []).map(s => s.properties.title);
+  tabsCache = { list: titles, at: now };
+  console.log('📑 Pestañas detectadas en el Sheet:', titles);
+  return titles;
+}
+
+function keywordsFor(asset) {
+  if (asset === 'XAUUSD') return ['xau', 'oro', 'gold'];
+  return ['mnq', 'nas', 'nasdaq']; // MNQU26, MNQ, NAS100...
+}
+
+async function resolveTabName(asset) {
+  try {
+    const titles = await getSheetTitles();
+    const kws = keywordsFor(asset);
+    const norm = (s) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+    const match = titles.find(t => {
+      const nt = norm(t);
+      return kws.some(k => nt.includes(k));
+    });
+    if (match) return match;
+    console.error(`⚠️ No se encontró pestaña para ${asset}. Pestañas disponibles:`, titles);
+    return titles[0] || 'Hoja 1';
+  } catch (e) {
+    console.error('resolveTabName error:', e.message);
+    return 'Hoja 1';
+  }
+}
+
 // ── Leer estadísticas desde Google Sheets (pestaña propia por activo) ──
 async function readStatsFromSheet(asset) {
   try {
     const sheets = await getSheetsClient();
-    const tab = tabFor(asset);
+    const tab = await resolveTabName(asset);
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `'${tab}'!A:N`
@@ -54,9 +84,10 @@ async function readStatsFromSheet(asset) {
     const rows = res.data.values || [];
     if (rows.length <= 1) return null; // solo cabecera
 
-    // Ya no hace falta filtrar por activo: cada pestaña es de un solo activo.
-    // Se deja el filtro como red de seguridad por si hay filas mezcladas.
-    const filtered = rows.slice(1).filter(r => !asset || !r[1] || r[1] === asset);
+    // Cada pestaña ya es de un solo activo: se usan todas las filas de datos,
+    // sin filtrar por el texto exacto de la columna "Activo" (evita descartes
+    // por diferencias como "MNQ" vs "MNQU26").
+    const filtered = rows.slice(1).filter(r => r && r[0]);
 
     const total   = filtered.length;
     const wins    = filtered.filter(r => r[8] === 'WIN').length;
@@ -87,7 +118,7 @@ async function readStatsFromSheet(asset) {
     }));
 
     return { total, wins, losses, tp1Hits, tp2Hits, tp3Hits, slHits,
-             pnlR:pnlR.toFixed(2), win_rate:wr+'%',
+             pnlR:pnlR.toFixed(2), win_rate:wr+'%', tab,
              this_week:{ total:wTotal, wins:wWins, pnlR:wPnl.toFixed(2), win_rate:wWr+'%' },
              last_10:last10 };
   } catch(e) {
@@ -100,7 +131,7 @@ async function appendToSheet(row) {
   try {
     const sheets = await getSheetsClient();
     const asset = row[1];
-    const tab = tabFor(asset);
+    const tab = await resolveTabName(asset);
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `'${tab}'!A:N`,
@@ -461,7 +492,7 @@ app.get('/stats', async (req, res) => {
     const xau = await readStatsFromSheet('XAUUSD');
     const mnq = await readStatsFromSheet('MNQU26');
     res.json({
-      source: 'Google Sheets (histórico permanente, pestañas separadas por activo)',
+      source: 'Google Sheets (histórico permanente, pestañas auto-detectadas por activo)',
       active_trades: Object.keys(activeTrades).length,
       XAUUSD: xau || { error: 'Sin datos aún' },
       MNQU26: mnq || { error: 'Sin datos aún' }
@@ -471,11 +502,26 @@ app.get('/stats', async (req, res) => {
   }
 });
 
+// ── GET /debug-sheets ────────────────────────────────────────
+// Endpoint de diagnóstico: muestra qué pestañas ve el bot realmente
+// y a cuál resuelve cada activo. Útil si /stats no encuentra datos.
+app.get('/debug-sheets', async (req, res) => {
+  try {
+    const titles = await getSheetTitles();
+    const xauTab = await resolveTabName('XAUUSD');
+    const mnqTab = await resolveTabName('MNQU26');
+    res.json({ titles_found: titles, XAUUSD_resolves_to: xauTab, MNQU26_resolves_to: mnqTab });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req,res) => res.json({
   status:'✅ DTC Signals Bot running',
   cooldown_min:COOLDOWN_MIN,
   active_trades:Object.keys(activeTrades).length,
-  stats_url:'/stats'
+  stats_url:'/stats',
+  debug_url:'/debug-sheets'
 }));
 
 app.post('/weekly', async (req,res) => {
