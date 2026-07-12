@@ -39,7 +39,7 @@ async function appendToSheet(row) {
     const sheets = await getSheetsClient();
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Sheet1!A:N',
+      range: 'Hoja 1!A:N',
       valueInputOption: 'USER_ENTERED',
       resource: { values: [row] }
     });
