@@ -32,6 +32,58 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
+// ── Leer estadísticas desde Google Sheets ────────────────────
+async function readStatsFromSheet(asset) {
+  try {
+    const sheets = await getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: 'Hoja 1!A:N'
+    });
+    const rows = res.data.values || [];
+    if (rows.length <= 1) return null; // solo cabecera
+
+    // Filtrar por activo
+    const filtered = rows.slice(1).filter(r => !asset || r[1] === asset);
+
+    const total   = filtered.length;
+    const wins    = filtered.filter(r => r[8] === 'WIN').length;
+    const losses  = filtered.filter(r => r[8] === 'LOSS').length;
+    const tp1Hits = filtered.filter(r => r[9] === 'SI').length;
+    const tp2Hits = filtered.filter(r => r[10] === 'SI').length;
+    const tp3Hits = filtered.filter(r => r[11] === 'SI').length;
+    const slHits  = filtered.filter(r => r[8] === 'LOSS').length;
+    const pnlR    = filtered.reduce((sum, r) => sum + (parseFloat(r[12]) || 0), 0);
+    const wr      = total > 0 ? (wins/total*100).toFixed(1) : '0.0';
+
+    // Semana actual (últimos 7 días)
+    const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate()-7);
+    const thisWeek = filtered.filter(r => {
+      const parts = (r[0]||'').split('/');
+      if (parts.length < 3) return false;
+      const d = new Date(parts[2], parts[1]-1, parts[0]);
+      return d >= weekAgo;
+    });
+    const wTotal  = thisWeek.length;
+    const wWins   = thisWeek.filter(r => r[8]==='WIN').length;
+    const wPnl    = thisWeek.reduce((sum,r) => sum+(parseFloat(r[12])||0),0);
+    const wWr     = wTotal>0 ? (wWins/wTotal*100).toFixed(1) : '0.0';
+
+    // Últimas 10
+    const last10 = filtered.slice(-10).reverse().map(r => ({
+      date:r[0], asset:r[1], direction:r[2], result:r[8], pnlR:r[12]
+    }));
+
+    return { total, wins, losses, tp1Hits, tp2Hits, tp3Hits, slHits,
+             pnlR:pnlR.toFixed(2), win_rate:wr+'%',
+             this_week:{ total:wTotal, wins:wWins, pnlR:wPnl.toFixed(2), win_rate:wWr+'%' },
+             last_10:last10 };
+  } catch(e) {
+    console.error('readStats error:', e.message);
+    return null;
+  }
+}
+
 async function appendToSheet(row) {
   try {
     const sheets = await getSheetsClient();
@@ -49,11 +101,78 @@ async function appendToSheet(row) {
 
 // ── Discord ──────────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-client.once('ready', () => {
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+
+client.once('ready', async () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
   startPriceMonitor();
   scheduleWeeklyReport();
+
+  // Registrar comandos slash
+  const commands = [
+    new SlashCommandBuilder().setName('stats').setDescription('Ver estadísticas de señales DTC'),
+    new SlashCommandBuilder().setName('resumen').setDescription('Forzar resumen semanal ahora'),
+    new SlashCommandBuilder().setName('activas').setDescription('Ver operaciones activas ahora mismo'),
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version:'10' }).setToken(DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log('✅ Comandos slash registrados');
+  } catch(e) { console.error('Slash error:', e.message); }
+});
+
+// Manejar comandos slash
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === 'stats') {
+    await interaction.deferReply();
+    const xau = await readStatsFromSheet('XAUUSD') || {};
+    const mnq = await readStatsFromSheet('MNQU26') || {};
+    const desc = [
+      `## 📊 ESTADÍSTICAS DTC SIGNALS`,``,
+      `**🥇 XAUUSD (Oro)**`,
+      `Trades: ${xau.total||0} | Wins: ${xau.wins||0} | Losses: ${xau.losses||0}`,
+      `Win Rate: ${xau.win_rate||'0.0%'} | PnL: ${xau.pnlR||'0.00'}R`,
+      `TP1: ${xau.tp1Hits||0} | TP2: ${xau.tp2Hits||0} | TP3: ${xau.tp3Hits||0} | SL: ${xau.slHits||0}`,
+      `Esta semana: ${xau.this_week?.total||0} trades | ${xau.this_week?.win_rate||'0.0%'} WR`,
+      ``,
+      `**📈 MNQU26 (Nasdaq)**`,
+      `Trades: ${mnq.total||0} | Wins: ${mnq.wins||0} | Losses: ${mnq.losses||0}`,
+      `Win Rate: ${mnq.win_rate||'0.0%'} | PnL: ${mnq.pnlR||'0.00'}R`,
+      `TP1: ${mnq.tp1Hits||0} | TP2: ${mnq.tp2Hits||0} | TP3: ${mnq.tp3Hits||0} | SL: ${mnq.slHits||0}`,
+      `Esta semana: ${mnq.this_week?.total||0} trades | ${mnq.this_week?.win_rate||'0.0%'} WR`,
+      ``,
+      `**Operaciones activas:** ${Object.keys(activeTrades).length}`,
+      `📊 *Datos del historial permanente en Google Sheets*`,
+      ``,
+      `*— Despierta Tu Capital (DTC)*`
+    ].join('\n');
+    await interaction.editReply({ embeds: [{ color:0x00BFFF, description:desc,
+      footer:{text:'DTC · Historial permanente Google Sheets'}, timestamp:new Date().toISOString() }] });
+  }
+
+  else if (interaction.commandName === 'resumen') {
+    await interaction.reply({ content:'⏳ Generando resumen semanal...', ephemeral:true });
+    await sendWeeklyReport();
+  }
+
+  else if (interaction.commandName === 'activas') {
+    const ids = Object.keys(activeTrades);
+    if (ids.length === 0) {
+      await interaction.reply({ content:'No hay operaciones activas ahora mismo.', ephemeral:true });
+      return;
+    }
+    const lines = ids.map(id => {
+      const t = activeTrades[id];
+      return `**${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1} | TP3: ${t.tp3}`;
+    });
+    await interaction.reply({ embeds: [{ color:0xD4E600,
+      description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}`,
+      footer:{text:'DTC · Monitor en tiempo real'}, timestamp:new Date().toISOString() }] });
+  }
 });
 client.login(DISCORD_TOKEN);
 
@@ -322,24 +441,20 @@ app.post('/signal', async (req, res) => {
 });
 
 // ── GET /stats ────────────────────────────────────────────────
-app.get('/stats', (req, res) => {
-  const fmt = (s) => {
-    const wr  = s.total>0 ? (s.wins/s.total*100).toFixed(1):'0.0';
-    const wrW = s.weeklyStats.total>0 ? (s.weeklyStats.wins/s.weeklyStats.total*100).toFixed(1):'0.0';
-    return {
-      total:s.total, wins:s.wins, losses:s.losses,
-      win_rate:wr+'%', pnl_r:s.pnlR.toFixed(2)+'R',
-      tp1_hits:s.tp1Hits, tp2_hits:s.tp2Hits,
-      tp3_hits:s.tp3Hits, sl_hits:s.slHits,
-      this_week:{ ...s.weeklyStats, win_rate:wrW+'%' },
-      last_10:s.history.slice(0,10)
-    };
-  };
-  res.json({
-    active_trades: Object.keys(activeTrades).length,
-    XAUUSD: fmt(stats.XAUUSD),
-    MNQU26: fmt(stats.MNQU26)
-  });
+app.get('/stats', async (req, res) => {
+  try {
+    const asset = req.query.asset; // opcional: ?asset=XAUUSD o ?asset=MNQU26
+    const xau = await readStatsFromSheet('XAUUSD');
+    const mnq = await readStatsFromSheet('MNQU26');
+    res.json({
+      source: 'Google Sheets (histórico permanente)',
+      active_trades: Object.keys(activeTrades).length,
+      XAUUSD: xau || { error: 'Sin datos aún' },
+      MNQU26: mnq || { error: 'Sin datos aún' }
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/', (req,res) => res.json({
