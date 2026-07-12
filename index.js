@@ -38,7 +38,8 @@ async function getCurrentPrice(asset) {
     return new Promise((resolve, reject) => {
       // Twelve Data API — gratuita, no necesita key para algunos símbolos
       const symbol = asset === 'XAUUSD' ? 'XAU/USD' : 'NAS100/USD';
-      const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=demo`;
+      const apiKey = process.env.TWELVE_API_KEY || 'demo';
+      const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`;
       https.get(url, (res) => {
         let data = '';
         res.on('data', d => data += d);
