@@ -7,17 +7,9 @@ const CHANNEL_CFD    = process.env.CHANNEL_CFD;
 const CHANNEL_FUTURE = process.env.CHANNEL_FUTURE;
 const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 
-// ── Cooldown posibles señales ─────────────────────────────────
 const COOLDOWN_MIN = 5;
 const lastPossible = {};
 
-// ── Parámetros del sistema por activo ────────────────────────
-const PARAMS = {
-  'XAUUSD': { slMult: 1.5, tpMult: 4.1, atrApprox: null }, // ATR viene del mensaje
-  'MNQU26': { slMult: 1.0, tpMult: 1.8, atrApprox: null },
-};
-
-// ── Discord ──────────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.once('ready', () => console.log(`✅ Bot conectado: ${client.user.tag}`));
@@ -27,99 +19,96 @@ const COLOR_WARN  = 0xD4E600;
 const COLOR_LONG  = 0x00C853;
 const COLOR_SHORT = 0xFF3B5C;
 
-// ── Helper: calcular SL/TP si no vienen en el mensaje ────────
-function calcLevels(entry, direction, atr, slMult, tpMult) {
-  const e  = parseFloat(entry);
-  const sl = parseFloat(atr) * slMult;
-  const tp = parseFloat(atr) * tpMult;
-  if (direction === 'LONG') {
-    return {
-      sl: (e - sl).toFixed(2),
-      tp: (e + tp).toFixed(2),
-    };
-  } else {
-    return {
-      sl: (e + sl).toFixed(2),
-      tp: (e - tp).toFixed(2),
-    };
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// POST /signal
-// ═══════════════════════════════════════════════════════════════
 app.post('/signal', async (req, res) => {
   try {
     if (req.query.key !== SECRET_KEY) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { type, asset, direction, entry, sl, tp, rr, score, atr } = req.body;
-    console.log(`📨 ${type} | ${asset} | ${direction} | entry:${entry} atr:${atr}`);
+    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr } = req.body;
+    console.log(`📨 ${type} | ${asset} | ${direction}`);
 
     const isFuture  = asset === 'MNQU26' || asset === 'MNQ';
     const channelId = isFuture ? CHANNEL_FUTURE : CHANNEL_CFD;
     const channel   = await client.channels.fetch(channelId);
     if (!channel) return res.status(500).json({ error: 'Canal no encontrado' });
 
-    // ── POSIBLE SEÑAL ─────────────────────────────────────────
+    // ── POSIBLE ───────────────────────────────────────────────
     if (type === 'possible') {
       const now     = Date.now();
       const lastT   = lastPossible[asset] || 0;
       const diffMin = (now - lastT) / 60000;
 
       if (diffMin < COOLDOWN_MIN) {
-        console.log(`⏳ Cooldown ${asset} — ${(COOLDOWN_MIN-diffMin).toFixed(1)}min restantes`);
+        console.log(`⏳ Cooldown ${asset}`);
         return res.status(200).json({ ok: true, skipped: true });
       }
-
       lastPossible[asset] = now;
 
+      const dirTxt = direction ? ` ${direction}` : '';
       await channel.send({
         embeds: [{
           color: COLOR_WARN,
-          description: `## ⚠️ POSIBLE SEÑAL — ${asset}\n\nEsperando confirmación... no te precipites !!!`,
+          description: `## ⚠️ POSIBLE SEÑAL — ${asset}${dirTxt}\n\nEsperando confirmación... no te precipites !!!`,
           footer: { text: 'Despierta Tu Capital (DTC)' },
           timestamp: new Date().toISOString(),
         }]
       });
-      console.log(`✅ Posible enviada → ${asset}`);
+      console.log(`✅ Posible → ${asset}`);
     }
 
-    // ── SEÑAL CONFIRMADA ──────────────────────────────────────
+    // ── CONFIRMADA ────────────────────────────────────────────
     else if (type === 'confirmed') {
       lastPossible[asset] = 0;
 
-      const isLong  = direction === 'LONG';
-      const color   = isLong ? COLOR_LONG : COLOR_SHORT;
-      const arrow   = isLong ? '📈' : '📉';
-      const params  = PARAMS[asset] || PARAMS['MNQU26'];
+      const isLong = direction === 'LONG';
+      const color  = isLong ? COLOR_LONG : COLOR_SHORT;
+      const arrow  = isLong ? '📈' : '📉';
 
-      // Calcular SL/TP si no vienen o son undefined
-      let slFinal = sl && sl !== 'undefined' ? sl : null;
-      let tpFinal = tp && tp !== 'undefined' ? tp : null;
+      // Determinar si usa 3 TPs o 1 TP
+      const has3TP = tp1 && tp2 && tp3;
 
-      if ((!slFinal || !tpFinal) && atr && entry) {
-        const levels = calcLevels(entry, direction, atr, params.slMult, params.tpMult);
-        slFinal = slFinal || levels.sl;
-        tpFinal = tpFinal || levels.tp;
+      // Calcular SL/TP si vienen por ATR
+      let slFinal  = sl && sl !== 'undefined' ? sl : null;
+      let tp1Final = tp1 && tp1 !== 'undefined' ? tp1 : (tp && tp !== 'undefined' ? tp : null);
+      let tp2Final = tp2 && tp2 !== 'undefined' ? tp2 : null;
+      let tp3Final = tp3 && tp3 !== 'undefined' ? tp3 : null;
+
+      if (!slFinal && atr && entry) {
+        const atrV = parseFloat(atr);
+        const entV = parseFloat(entry);
+        const slM  = isFuture ? 1.0 : 1.5;
+        slFinal = isLong ? (entV - atrV * slM).toFixed(2) : (entV + atrV * slM).toFixed(2);
+      }
+      if (!tp1Final && atr && entry) {
+        const atrV  = parseFloat(atr);
+        const entV  = parseFloat(entry);
+        const tp1M  = isFuture ? 0.75 : 1.125;
+        const tp2M  = isFuture ? 1.25 : 2.625;
+        const tp3M  = isFuture ? 1.8  : 4.1;
+        tp1Final = isLong ? (entV + atrV * tp1M).toFixed(2) : (entV - atrV * tp1M).toFixed(2);
+        tp2Final = isLong ? (entV + atrV * tp2M).toFixed(2) : (entV - atrV * tp2M).toFixed(2);
+        tp3Final = isLong ? (entV + atrV * tp3M).toFixed(2) : (entV - atrV * tp3M).toFixed(2);
       }
 
-      const rrFinal = rr || params.tpMult.toFixed(1);
+      const rr1Final = rr1 || '0.75';
+      const rr2Final = rr2 || '1.75';
+      const rr3Final = rr3 || (rr || (isFuture ? '1.8' : '2.74'));
 
       const lines = [
         `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,
         ``,
         `🎯 **Entrada:** \`${entry}\``,
         slFinal ? `🛑 **Stop Loss:** \`${slFinal}\`` : null,
-        tpFinal ? `💰 **Take Profit:** \`${tpFinal}\`` : null,
-        `📊 **RR:** \`1:${rrFinal}\``,
-        score ? `⭐ **Score:** \`${score}/10\`` : null,
+        ``,
+        tp1Final ? `🟢 **TP1:** \`${tp1Final}\`  *(RR 1:${rr1Final})*` : null,
+        tp2Final ? `🟡 **TP2:** \`${tp2Final}\`  *(RR 1:${rr2Final})*` : null,
+        tp3Final ? `🏆 **TP3:** \`${tp3Final}\`  *(RR 1:${rr3Final})*` : null,
+        score    ? `\n⭐ **Score:** \`${score}/10\`` : null,
       ].filter(Boolean);
 
-      // Aviso precio para futuros
       if (isFuture) {
-        lines.push(``, `> ⚠️ *Precio en NAS100. En MNQU26 suma ~350 pts al precio de entrada.*`);
+        lines.push(``, `> ⚠️ *Precio en NAS100. En MNQU26 suma ~350 pts.*`);
       }
 
       lines.push(``, `*— Despierta Tu Capital (DTC)*`);
@@ -132,7 +121,7 @@ app.post('/signal', async (req, res) => {
           timestamp: new Date().toISOString(),
         }]
       });
-      console.log(`✅ Confirmada → ${asset} ${direction} entrada:${entry} sl:${slFinal} tp:${tpFinal}`);
+      console.log(`✅ Confirmada → ${asset} ${direction}`);
     }
 
     res.status(200).json({ ok: true });
