@@ -9,6 +9,16 @@ const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
 const SHEET_ID       = process.env.SHEET_ID;
 
+// ── Pestañas del Google Sheet por activo ────────────────────
+// Cada activo escribe/lee en su propia pestaña en vez de compartir "Hoja 1"
+const SHEET_TABS = {
+  XAUUSD: 'XAUUSD',
+  MNQU26: 'MNQ - NAS100'
+};
+function tabFor(asset) {
+  return SHEET_TABS[asset] || 'Hoja 1';
+}
+
 const COOLDOWN_MIN = 5;
 const lastPossible = {};
 const activeTrades = {};
@@ -32,19 +42,21 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ── Leer estadísticas desde Google Sheets ────────────────────
+// ── Leer estadísticas desde Google Sheets (pestaña propia por activo) ──
 async function readStatsFromSheet(asset) {
   try {
     const sheets = await getSheetsClient();
+    const tab = tabFor(asset);
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: 'Hoja 1!A:N'
+      range: `'${tab}'!A:N`
     });
     const rows = res.data.values || [];
     if (rows.length <= 1) return null; // solo cabecera
 
-    // Filtrar por activo
-    const filtered = rows.slice(1).filter(r => !asset || r[1] === asset);
+    // Ya no hace falta filtrar por activo: cada pestaña es de un solo activo.
+    // Se deja el filtro como red de seguridad por si hay filas mezcladas.
+    const filtered = rows.slice(1).filter(r => !asset || !r[1] || r[1] === asset);
 
     const total   = filtered.length;
     const wins    = filtered.filter(r => r[8] === 'WIN').length;
@@ -87,13 +99,15 @@ async function readStatsFromSheet(asset) {
 async function appendToSheet(row) {
   try {
     const sheets = await getSheetsClient();
+    const asset = row[1];
+    const tab = tabFor(asset);
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Hoja 1!A:N',
+      range: `'${tab}'!A:N`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: [row] }
     });
-    console.log('✅ Fila añadida a Google Sheets');
+    console.log(`✅ Fila añadida a Google Sheets → pestaña "${tab}"`);
   } catch(e) {
     console.error('❌ Sheets error:', e.message);
   }
@@ -146,7 +160,7 @@ client.on('interactionCreate', async (interaction) => {
       `Esta semana: ${mnq.this_week?.total||0} trades | ${mnq.this_week?.win_rate||'0.0%'} WR`,
       ``,
       `**Operaciones activas:** ${Object.keys(activeTrades).length}`,
-      `📊 *Datos del historial permanente en Google Sheets*`,
+      `📊 *Datos del historial permanente en Google Sheets (pestañas separadas por activo)*`,
       ``,
       `*— Despierta Tu Capital (DTC)*`
     ].join('\n');
@@ -223,7 +237,7 @@ async function recordResult(trade, result, rPnl) {
   s.history.unshift(entry);
   if (s.history.length > 50) s.history.pop();
 
-  // Escribir en Google Sheets
+  // Escribir en Google Sheets — appendToSheet elige la pestaña según row[1] (asset)
   const now = new Date();
   const row = [
     now.toLocaleDateString('es-ES'),
@@ -447,7 +461,7 @@ app.get('/stats', async (req, res) => {
     const xau = await readStatsFromSheet('XAUUSD');
     const mnq = await readStatsFromSheet('MNQU26');
     res.json({
-      source: 'Google Sheets (histórico permanente)',
+      source: 'Google Sheets (histórico permanente, pestañas separadas por activo)',
       active_trades: Object.keys(activeTrades).length,
       XAUUSD: xau || { error: 'Sin datos aún' },
       MNQU26: mnq || { error: 'Sin datos aún' }
