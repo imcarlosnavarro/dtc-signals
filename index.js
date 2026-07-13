@@ -33,9 +33,6 @@ async function getSheetsClient() {
 }
 
 // ── Detección automática de pestaña por activo ──────────────────
-// En vez de exigir un nombre exacto (frágil: espacios, guiones, tildes...),
-// se listan las pestañas reales del Sheet y se elige la que mejor coincide
-// con palabras clave del activo. Se cachea 5 minutos para no golpear la API.
 let tabsCache = { list: null, at: 0 };
 
 async function getSheetTitles() {
@@ -51,7 +48,7 @@ async function getSheetTitles() {
 
 function keywordsFor(asset) {
   if (asset === 'XAUUSD') return ['xau', 'oro', 'gold'];
-  return ['mnq', 'nas', 'nasdaq']; // MNQU26, MNQ, NAS100...
+  return ['mnq', 'nas', 'nasdaq'];
 }
 
 async function resolveTabName(asset) {
@@ -73,6 +70,9 @@ async function resolveTabName(asset) {
 }
 
 // ── Leer estadísticas desde Google Sheets (pestaña propia por activo) ──
+// Win rate = wins / (wins + losses). Los BE (histórico antiguo) NO cuentan
+// ni como ganadora ni como perdedora — se excluyen del cálculo por completo,
+// igual que en el Excel original de Carlos.
 async function readStatsFromSheet(asset) {
   try {
     const sheets = await getSheetsClient();
@@ -84,20 +84,19 @@ async function readStatsFromSheet(asset) {
     const rows = res.data.values || [];
     if (rows.length <= 1) return null; // solo cabecera
 
-    // Cada pestaña ya es de un solo activo: se usan todas las filas de datos,
-    // sin filtrar por el texto exacto de la columna "Activo" (evita descartes
-    // por diferencias como "MNQ" vs "MNQU26").
     const filtered = rows.slice(1).filter(r => r && r[0]);
 
     const total   = filtered.length;
     const wins    = filtered.filter(r => r[8] === 'WIN').length;
     const losses  = filtered.filter(r => r[8] === 'LOSS').length;
+    const be      = filtered.filter(r => r[8] === 'BE').length;
+    const decided = wins + losses; // excluye BE del divisor
     const tp1Hits = filtered.filter(r => r[9] === 'SI').length;
     const tp2Hits = filtered.filter(r => r[10] === 'SI').length;
     const tp3Hits = filtered.filter(r => r[11] === 'SI').length;
-    const slHits  = filtered.filter(r => r[8] === 'LOSS').length;
+    const slHits  = losses; // solo cuentan como "SL tocado" las derrotas reales
     const pnlR    = filtered.reduce((sum, r) => sum + (parseFloat(r[12]) || 0), 0);
-    const wr      = total > 0 ? (wins/total*100).toFixed(1) : '0.0';
+    const wr      = decided > 0 ? (wins/decided*100).toFixed(1) : '0.0';
 
     // Semana actual (últimos 7 días)
     const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate()-7);
@@ -107,17 +106,19 @@ async function readStatsFromSheet(asset) {
       const d = new Date(parts[2], parts[1]-1, parts[0]);
       return d >= weekAgo;
     });
-    const wTotal  = thisWeek.length;
-    const wWins   = thisWeek.filter(r => r[8]==='WIN').length;
-    const wPnl    = thisWeek.reduce((sum,r) => sum+(parseFloat(r[12])||0),0);
-    const wWr     = wTotal>0 ? (wWins/wTotal*100).toFixed(1) : '0.0';
+    const wTotal   = thisWeek.length;
+    const wWins    = thisWeek.filter(r => r[8]==='WIN').length;
+    const wLosses  = thisWeek.filter(r => r[8]==='LOSS').length;
+    const wDecided = wWins + wLosses;
+    const wPnl     = thisWeek.reduce((sum,r) => sum+(parseFloat(r[12])||0),0);
+    const wWr      = wDecided>0 ? (wWins/wDecided*100).toFixed(1) : '0.0';
 
     // Últimas 10
     const last10 = filtered.slice(-10).reverse().map(r => ({
       date:r[0], asset:r[1], direction:r[2], result:r[8], pnlR:r[12]
     }));
 
-    return { total, wins, losses, tp1Hits, tp2Hits, tp3Hits, slHits,
+    return { total, wins, losses, be, tp1Hits, tp2Hits, tp3Hits, slHits,
              pnlR:pnlR.toFixed(2), win_rate:wr+'%', tab,
              this_week:{ total:wTotal, wins:wWins, pnlR:wPnl.toFixed(2), win_rate:wWr+'%' },
              last_10:last10 };
@@ -154,7 +155,6 @@ client.once('ready', async () => {
   startPriceMonitor();
   scheduleWeeklyReport();
 
-  // Registrar comandos slash
   const commands = [
     new SlashCommandBuilder().setName('stats').setDescription('Ver estadísticas de señales DTC'),
     new SlashCommandBuilder().setName('resumen').setDescription('Forzar resumen semanal ahora'),
@@ -168,7 +168,6 @@ client.once('ready', async () => {
   } catch(e) { console.error('Slash error:', e.message); }
 });
 
-// Manejar comandos slash
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -179,19 +178,19 @@ client.on('interactionCreate', async (interaction) => {
     const desc = [
       `## 📊 ESTADÍSTICAS DTC SIGNALS`,``,
       `**🥇 XAUUSD (Oro)**`,
-      `Trades: ${xau.total||0} | Wins: ${xau.wins||0} | Losses: ${xau.losses||0}`,
+      `Trades: ${xau.total||0} | Wins: ${xau.wins||0} | Losses: ${xau.losses||0}${xau.be?` | BE (antiguas, no cuentan): ${xau.be}`:''}`,
       `Win Rate: ${xau.win_rate||'0.0%'} | PnL: ${xau.pnlR||'0.00'}R`,
       `TP1: ${xau.tp1Hits||0} | TP2: ${xau.tp2Hits||0} | TP3: ${xau.tp3Hits||0} | SL: ${xau.slHits||0}`,
       `Esta semana: ${xau.this_week?.total||0} trades | ${xau.this_week?.win_rate||'0.0%'} WR`,
       ``,
       `**📈 MNQU26 (Nasdaq)**`,
-      `Trades: ${mnq.total||0} | Wins: ${mnq.wins||0} | Losses: ${mnq.losses||0}`,
+      `Trades: ${mnq.total||0} | Wins: ${mnq.wins||0} | Losses: ${mnq.losses||0}${mnq.be?` | BE (antiguas, no cuentan): ${mnq.be}`:''}`,
       `Win Rate: ${mnq.win_rate||'0.0%'} | PnL: ${mnq.pnlR||'0.00'}R`,
       `TP1: ${mnq.tp1Hits||0} | TP2: ${mnq.tp2Hits||0} | TP3: ${mnq.tp3Hits||0} | SL: ${mnq.slHits||0}`,
       `Esta semana: ${mnq.this_week?.total||0} trades | ${mnq.this_week?.win_rate||'0.0%'} WR`,
       ``,
       `**Operaciones activas:** ${Object.keys(activeTrades).length}`,
-      `📊 *Datos del historial permanente en Google Sheets (pestañas separadas por activo)*`,
+      `📊 *Win Rate = Wins / (Wins + Losses). Las BE del histórico antiguo no cuentan.*`,
       ``,
       `*— Despierta Tu Capital (DTC)*`
     ].join('\n');
@@ -212,7 +211,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     const lines = ids.map(id => {
       const t = activeTrades[id];
-      return `**${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1} | TP3: ${t.tp3}`;
+      return `**${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1}${t.tp1Hit?' ✅':''} | TP3: ${t.tp3}`;
     });
     await interaction.reply({ embeds: [{ color:0xD4E600,
       description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}`,
@@ -223,7 +222,7 @@ client.login(DISCORD_TOKEN);
 
 const COLOR_WARN=0xD4E600, COLOR_LONG=0x00C853, COLOR_SHORT=0xFF3B5C;
 const COLOR_SL=0xFF0000, COLOR_TP1=0x00E676, COLOR_TP2=0x00C853;
-const COLOR_TP3=0xFFD700, COLOR_STATS=0x00BFFF;
+const COLOR_TP3=0xFFD700, COLOR_STATS=0x00BFFF, COLOR_LOCKED=0x00E676;
 
 // ── Precio actual ─────────────────────────────────────────────
 async function getCurrentPrice(asset) {
@@ -252,6 +251,7 @@ async function getCurrentPrice(asset) {
 }
 
 // ── Registrar resultado ───────────────────────────────────────
+// Solo existen dos resultados posibles: WIN o LOSS. No hay BE.
 async function recordResult(trade, result, rPnl) {
   const s = getStats(trade.asset);
   s.total++; s.weeklyStats.total++;
@@ -268,7 +268,6 @@ async function recordResult(trade, result, rPnl) {
   s.history.unshift(entry);
   if (s.history.length > 50) s.history.pop();
 
-  // Escribir en Google Sheets — appendToSheet elige la pestaña según row[1] (asset)
   const now = new Date();
   const row = [
     now.toLocaleDateString('es-ES'),
@@ -290,6 +289,10 @@ async function recordResult(trade, result, rPnl) {
 }
 
 // ── Monitor de precios ────────────────────────────────────────
+// Regla clave: si el precio ya tocó algún TP y luego retrocede hasta el SL
+// original, la operación se cuenta como GANADORA (con el R del último TP
+// alcanzado), nunca como perdedora. El SL solo cuenta como derrota real
+// si se toca ANTES de tocar cualquier TP.
 function startPriceMonitor() {
   setInterval(async () => {
     const ids = Object.keys(activeTrades);
@@ -308,15 +311,29 @@ function startPriceMonitor() {
         const channel = await client.channels.fetch(trade.channelId).catch(() => null);
         if (!channel) continue;
 
-        // SL
+        // SL / cierre tras haber tocado algún TP
         if (!trade.slHit && (isLong ? price <= trade.sl : price >= trade.sl)) {
-          trade.slHit = true; getStats(trade.asset).slHits++;
-          await channel.send({ embeds: [{
-            color: COLOR_SL,
-            description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida. −1R*\n*— Despierta Tu Capital (DTC)*`,
-            footer: { text: 'DTC · Gestión de riesgo' }, timestamp: new Date().toISOString()
-          }]});
-          await recordResult(trade, 'LOSS', -1);
+          trade.slHit = true;
+
+          if (trade.tp1Hit) {
+            // Ya había tocado al menos TP1 → se cuenta como GANADORA
+            const rUsed = trade.tp3Hit ? trade.rr3 : (trade.tp2Hit ? trade.rr2 : trade.rr1);
+            await channel.send({ embeds: [{
+              color: COLOR_LOCKED,
+              description: `## 🔒 CIERRE ASEGURADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n\nYa había tocado ${trade.tp3Hit?'TP2':'TP1'} antes de volver al nivel de SL — cuenta como **operación GANADORA (+${rUsed}R)**, no como pérdida.\n*— Despierta Tu Capital (DTC)*`,
+              footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+            }]});
+            await recordResult(trade, 'WIN', rUsed);
+          } else {
+            // SL directo, sin haber tocado ningún TP → derrota real
+            getStats(trade.asset).slHits++;
+            await channel.send({ embeds: [{
+              color: COLOR_SL,
+              description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida. −1R*\n*— Despierta Tu Capital (DTC)*`,
+              footer: { text: 'DTC · Gestión de riesgo' }, timestamp: new Date().toISOString()
+            }]});
+            await recordResult(trade, 'LOSS', -1);
+          }
           delete activeTrades[id]; continue;
         }
 
@@ -325,7 +342,7 @@ function startPriceMonitor() {
           trade.tp1Hit = true; getStats(trade.asset).tp1Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP1,
-            description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:0.75)*\n\n✅ *Cierra parcial o mueve SL a Break Even.*\n*— Despierta Tu Capital (DTC)*`,
+            description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:${trade.rr1})*\n\n✅ *A partir de aquí, aunque vuelva al SL, ya cuenta como GANADORA.*\n*— Despierta Tu Capital (DTC)*`,
             footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
           }]});
         }
@@ -335,7 +352,7 @@ function startPriceMonitor() {
           trade.tp2Hit = true; getStats(trade.asset).tp2Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP2,
-            description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
+            description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`  *(RR 1:${trade.rr2})*\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
             footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
           }]});
         }
@@ -345,10 +362,10 @@ function startPriceMonitor() {
           trade.tp3Hit = true; getStats(trade.asset).tp3Hits++;
           await channel.send({ embeds: [{
             color: COLOR_TP3,
-            description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP3:** \`${trade.tp3}\`\n\n🎯 *Objetivo final completado.*\n*— Despierta Tu Capital (DTC)*`,
+            description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP3:** \`${trade.tp3}\`  *(RR 1:${trade.rr3})*\n\n🎯 *Objetivo final completado.*\n*— Despierta Tu Capital (DTC)*`,
             footer: { text: 'DTC · Objetivo completado' }, timestamp: new Date().toISOString()
           }]});
-          await recordResult(trade, 'WIN', trade.tp1Hit && trade.tp2Hit ? 2.74 : 1.75);
+          await recordResult(trade, 'WIN', trade.rr3);
           delete activeTrades[id];
         }
       }
@@ -375,7 +392,8 @@ async function sendWeeklyReport() {
     for (const { asset, chId, emoji } of pairs) {
       const s = getStats(asset).weeklyStats;
       const st = getStats(asset);
-      const wr  = s.total>0 ? Math.round(s.wins/s.total*100) : 0;
+      const decided = s.wins + s.losses;
+      const wr  = decided>0 ? Math.round(s.wins/decided*100) : 0;
       const pnl = s.pnlR>=0 ? `+${s.pnlR.toFixed(2)}R` : `${s.pnlR.toFixed(2)}R`;
       const desc = [
         `## 📊 RESUMEN SEMANAL — ${emoji} ${asset}`,``,
@@ -386,7 +404,7 @@ async function sendWeeklyReport() {
         `🟢 TP1 tocados: ${st.tp1Hits}`,
         `🟡 TP2 tocados: ${st.tp2Hits}`,
         `🏆 TP3 tocados: ${st.tp3Hits}`,
-        `🛑 SL tocados: ${st.slHits}`,``,
+        `🛑 SL tocados (derrota real): ${st.slHits}`,``,
         `*— Despierta Tu Capital (DTC)*`
       ].join('\n');
       const ch = await client.channels.fetch(chId).catch(()=>null);
@@ -447,7 +465,9 @@ app.post('/signal', async (req, res) => {
       }
 
       const r=(v)=>v?Math.round(v*100)/100:null;
-      const rr1F=rr1||'0.75', rr2F=rr2||(isFuture?'1.25':'1.75'), rr3F=rr3||rr||(isFuture?'1.8':'2.74');
+      const rr1F = parseFloat(rr1) || 0.75;
+      const rr2F = parseFloat(rr2) || (isFuture?1.25:1.75);
+      const rr3F = parseFloat(rr3) || parseFloat(rr) || (isFuture?1.8:2.74);
 
       const lines = [
         `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,``,
@@ -470,6 +490,7 @@ app.post('/signal', async (req, res) => {
         activeTrades[id] = {
           id, asset, direction, entry:parseFloat(entry),
           sl:slF, tp1:tp1F, tp2:tp2F, tp3:tp3F,
+          rr1:rr1F, rr2:rr2F, rr3:rr3F,
           tp1Hit:false, tp2Hit:false, tp3Hit:false, slHit:false,
           channelId, score: score||'', openTime:new Date().toISOString()
         };
@@ -488,11 +509,11 @@ app.post('/signal', async (req, res) => {
 // ── GET /stats ────────────────────────────────────────────────
 app.get('/stats', async (req, res) => {
   try {
-    const asset = req.query.asset; // opcional: ?asset=XAUUSD o ?asset=MNQU26
     const xau = await readStatsFromSheet('XAUUSD');
     const mnq = await readStatsFromSheet('MNQU26');
     res.json({
       source: 'Google Sheets (histórico permanente, pestañas auto-detectadas por activo)',
+      note: 'win_rate = wins / (wins + losses). Los BE del histórico antiguo no cuentan.',
       active_trades: Object.keys(activeTrades).length,
       XAUUSD: xau || { error: 'Sin datos aún' },
       MNQU26: mnq || { error: 'Sin datos aún' }
@@ -502,9 +523,6 @@ app.get('/stats', async (req, res) => {
   }
 });
 
-// ── GET /debug-sheets ────────────────────────────────────────
-// Endpoint de diagnóstico: muestra qué pestañas ve el bot realmente
-// y a cuál resuelve cada activo. Útil si /stats no encuentra datos.
 app.get('/debug-sheets', async (req, res) => {
   try {
     const titles = await getSheetTitles();
