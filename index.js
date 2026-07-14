@@ -8,6 +8,7 @@ const CHANNEL_FUTURE = process.env.CHANNEL_FUTURE;
 const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
 const SHEET_ID       = process.env.SHEET_ID;
+const ACTIVE_TAB      = 'Activos';
 
 const COOLDOWN_MIN = 5;
 const lastPossible = {};
@@ -145,13 +146,76 @@ async function appendToSheet(row) {
   }
 }
 
+// ── Persistencia de operaciones activas ─────────────────────────
+// Guarda activeTrades en una pestaña "Activos" del Sheet para que,
+// si el bot se reinicia (redeploy, crash, etc.), no se pierda el
+// seguimiento de las operaciones que ya están abiertas.
+async function loadActiveTradesFromSheet() {
+  try {
+    const sheets = await getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `'${ACTIVE_TAB}'!A:R`
+    });
+    const rows = res.data.values || [];
+    if (rows.length <= 1) { console.log('📂 No hay operaciones activas guardadas en el Sheet.'); return; }
+    let restored = 0;
+    for (const r of rows.slice(1)) {
+      if (!r || !r[0]) continue;
+      const [id, asset, direction, entry, sl, tp1, tp2, tp3, rr1, rr2, rr3, tp1Hit, tp2Hit, tp3Hit, slHit, channelId, score, openTime] = r;
+      activeTrades[id] = {
+        id, asset, direction,
+        entry: parseFloat(entry),
+        sl:  sl  ? parseFloat(sl)  : null,
+        tp1: tp1 ? parseFloat(tp1) : null,
+        tp2: tp2 ? parseFloat(tp2) : null,
+        tp3: tp3 ? parseFloat(tp3) : null,
+        rr1: parseFloat(rr1) || 0.75,
+        rr2: parseFloat(rr2) || 1.75,
+        rr3: parseFloat(rr3) || 2.74,
+        tp1Hit: tp1Hit === 'SI', tp2Hit: tp2Hit === 'SI', tp3Hit: tp3Hit === 'SI', slHit: slHit === 'SI',
+        channelId, score: score || '', openTime: openTime || new Date().toISOString()
+      };
+      restored++;
+    }
+    console.log(`📂 ${restored} operación(es) activa(s) restaurada(s) desde el Sheet`);
+  } catch(e) {
+    console.error('loadActiveTrades error:', e.message);
+  }
+}
+
+async function syncActiveTradesToSheet() {
+  try {
+    const sheets = await getSheetsClient();
+    const rows = Object.values(activeTrades).map(t => [
+      t.id, t.asset, t.direction, t.entry,
+      t.sl ?? '', t.tp1 ?? '', t.tp2 ?? '', t.tp3 ?? '',
+      t.rr1 ?? '', t.rr2 ?? '', t.rr3 ?? '',
+      t.tp1Hit ? 'SI' : 'NO', t.tp2Hit ? 'SI' : 'NO', t.tp3Hit ? 'SI' : 'NO', t.slHit ? 'SI' : 'NO',
+      t.channelId, t.score ?? '', t.openTime
+    ]);
+    await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: `'${ACTIVE_TAB}'!A2:R2000` });
+    if (rows.length > 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `'${ACTIVE_TAB}'!A2`,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: rows }
+      });
+    }
+  } catch(e) {
+    console.error('syncActiveTrades error:', e.message);
+  }
+}
+
 // ── Discord ──────────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 client.once('ready', async () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
+  await loadActiveTradesFromSheet();
   startPriceMonitor();
   scheduleWeeklyReport();
 
@@ -159,6 +223,10 @@ client.once('ready', async () => {
     new SlashCommandBuilder().setName('stats').setDescription('Ver estadísticas de señales DTC'),
     new SlashCommandBuilder().setName('resumen').setDescription('Forzar resumen semanal ahora'),
     new SlashCommandBuilder().setName('activas').setDescription('Ver operaciones activas ahora mismo'),
+    new SlashCommandBuilder().setName('cerrar')
+      .setDescription('Cerrar manualmente una operación activa colgada (no registra resultado ni escribe en el Sheet)')
+      .addStringOption(opt => opt.setName('id').setDescription('ID de la operación, ej. trade_3 (mira /activas)').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version:'10' }).setToken(DISCORD_TOKEN);
@@ -211,11 +279,23 @@ client.on('interactionCreate', async (interaction) => {
     }
     const lines = ids.map(id => {
       const t = activeTrades[id];
-      return `**${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1}${t.tp1Hit?' ✅':''} | TP3: ${t.tp3}`;
+      return `\`${id}\` — **${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1}${t.tp1Hit?' ✅':''} | TP3: ${t.tp3}`;
     });
     await interaction.reply({ embeds: [{ color:0xD4E600,
-      description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}`,
+      description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}\n\n*Usa /cerrar id:<ID> para cerrar una manualmente si se queda colgada.*`,
       footer:{text:'DTC · Monitor en tiempo real'}, timestamp:new Date().toISOString() }] });
+  }
+
+  else if (interaction.commandName === 'cerrar') {
+    const id = interaction.options.getString('id');
+    const t = activeTrades[id];
+    if (!t) {
+      await interaction.reply({ content: `❌ No encuentro ninguna operación activa con ID \`${id}\`. Usa /activas para ver los IDs disponibles.`, ephemeral:true });
+      return;
+    }
+    delete activeTrades[id];
+    await syncActiveTradesToSheet();
+    await interaction.reply({ content: `✅ Operación \`${id}\` (${t.asset} ${t.direction}) cerrada manualmente. No se ha registrado ningún resultado ni se ha escrito nada en el Google Sheet.`, ephemeral:true });
   }
 });
 client.login(DISCORD_TOKEN);
@@ -334,7 +414,7 @@ function startPriceMonitor() {
             }]});
             await recordResult(trade, 'LOSS', -1);
           }
-          delete activeTrades[id]; continue;
+          delete activeTrades[id]; await syncActiveTradesToSheet(); continue;
         }
 
         // TP1
@@ -345,6 +425,7 @@ function startPriceMonitor() {
             description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:${trade.rr1})*\n\n✅ *A partir de aquí, aunque vuelva al SL, ya cuenta como GANADORA.*\n*— Despierta Tu Capital (DTC)*`,
             footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
           }]});
+          await syncActiveTradesToSheet();
         }
 
         // TP2
@@ -355,6 +436,7 @@ function startPriceMonitor() {
             description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${price}\`\n**TP2:** \`${trade.tp2}\`  *(RR 1:${trade.rr2})*\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
             footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
           }]});
+          await syncActiveTradesToSheet();
         }
 
         // TP3
@@ -366,7 +448,7 @@ function startPriceMonitor() {
             footer: { text: 'DTC · Objetivo completado' }, timestamp: new Date().toISOString()
           }]});
           await recordResult(trade, 'WIN', trade.rr3);
-          delete activeTrades[id];
+          delete activeTrades[id]; await syncActiveTradesToSheet();
         }
       }
     }
@@ -486,7 +568,7 @@ app.post('/signal', async (req, res) => {
         footer:{text:'DTC · Esto no es consejo de inversión'}, timestamp:new Date().toISOString() }]});
 
       if (slF || tp1F) {
-        const id = `trade_${++tradeCounter}`;
+        const id = `trade_${Date.now()}`;
         activeTrades[id] = {
           id, asset, direction, entry:parseFloat(entry),
           sl:slF, tp1:tp1F, tp2:tp2F, tp3:tp3F,
@@ -495,6 +577,7 @@ app.post('/signal', async (req, res) => {
           channelId, score: score||'', openTime:new Date().toISOString()
         };
         console.log(`📋 Trade guardado: ${id} | ${asset} ${direction}`);
+        await syncActiveTradesToSheet();
       }
     }
 
