@@ -305,10 +305,13 @@ const COLOR_SL=0xFF0000, COLOR_TP1=0x00E676, COLOR_TP2=0x00C853;
 const COLOR_TP3=0xFFD700, COLOR_STATS=0x00BFFF, COLOR_LOCKED=0x00E676;
 
 // ── Precio actual ─────────────────────────────────────────────
+// IMPORTANTE: esta función NUNCA debe lanzar/rechazar — si algo falla
+// (símbolo no disponible en el plan, red caída, JSON inválido, etc.)
+// tiene que devolver null en vez de tirar el proceso entero abajo.
 async function getCurrentPrice(asset) {
-  try {
-    const https = require('https');
-    return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    try {
+      const https = require('https');
       const symbol = asset === 'XAUUSD' ? 'XAU/USD' : 'NDX';
       const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbol)}&apikey=${TWELVE_KEY}`;
       https.get(url, (res) => {
@@ -319,15 +322,15 @@ async function getCurrentPrice(asset) {
             const json = JSON.parse(data);
             const price = parseFloat(json.price);
             if (!isNaN(price)) { console.log(`💰 ${asset}: ${price}`); resolve(price); }
-            else reject(new Error('No price: ' + data));
-          } catch(e) { reject(e); }
+            else { console.error(`⚠️ Price error (${asset}): ${data}`); resolve(null); }
+          } catch(e) { console.error('Price parse error:', e.message); resolve(null); }
         });
-      }).on('error', reject);
-    });
-  } catch(e) {
-    console.error('Price error:', e.message);
-    return null;
-  }
+      }).on('error', (e) => { console.error('Price request error:', e.message); resolve(null); });
+    } catch(e) {
+      console.error('Price error:', e.message);
+      resolve(null);
+    }
+  });
 }
 
 // ── Registrar resultado ───────────────────────────────────────
@@ -385,6 +388,7 @@ function startPriceMonitor() {
       if (!price) continue;
 
       for (const id of [...ids]) {
+       try {
         const trade = activeTrades[id];
         if (!trade || trade.asset !== asset) continue;
         const isLong = trade.direction === 'LONG';
@@ -450,6 +454,9 @@ function startPriceMonitor() {
           await recordResult(trade, 'WIN', trade.rr3);
           delete activeTrades[id]; await syncActiveTradesToSheet();
         }
+       } catch(e) {
+         console.error(`⚠️ Error monitorizando trade ${id}:`, e.message);
+       }
       }
     }
   }, 60000);
