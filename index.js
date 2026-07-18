@@ -9,9 +9,18 @@ const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
 const SHEET_ID       = process.env.SHEET_ID;
 const ACTIVE_TAB      = 'Activos';
+// Frecuencia de sondeo de precio en ms. Con el plan gratis de Twelve Data (800
+// créditos/día) hay que dejarlo alto (60000 = 60s) para no agotar el cupo.
+// Con el plan Grow (o superior, sin límite diario) se puede bajar a 15000-20000
+// para detectar TPs/SL más rápido. Configurable por variable de entorno en
+// Railway sin tener que tocar el código cada vez.
+const PRICE_POLL_MS = parseInt(process.env.PRICE_POLL_MS) || 60000;
 
 const COOLDOWN_MIN = 5;
+const STUCK_TRADE_HOURS = 10; // aviso en /activas si una operación lleva abierta más de esto
+const DUPLICATE_WINDOW_MIN = 3; // ignora una CONFIRMADA repetida (mismo activo+dirección+entrada) en esta ventana
 const lastPossible = {};
+const lastConfirmed = {};
 const activeTrades = {};
 let tradeCounter = 0;
 
@@ -215,6 +224,7 @@ const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('disc
 
 client.once('ready', async () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
+  console.log(`⏱️ Sondeo de precio cada ${PRICE_POLL_MS/1000}s`);
   await loadActiveTradesFromSheet();
   startPriceMonitor();
   scheduleWeeklyReport();
@@ -282,10 +292,12 @@ client.on('interactionCreate', async (interaction) => {
     }
     const lines = ids.map(id => {
       const t = activeTrades[id];
-      return `\`${id}\` — **${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1}${t.tp1Hit?' ✅':''} | TP3: ${t.tp3}`;
+      const hoursOpen = (Date.now() - new Date(t.openTime).getTime()) / 3600000;
+      const stuckTag = hoursOpen > STUCK_TRADE_HOURS ? ` ⚠️ *lleva ${Math.round(hoursOpen)}h abierta*` : '';
+      return `\`${id}\` — **${t.asset} ${t.direction}** | Entrada: ${t.entry} | SL: ${t.sl} | TP1: ${t.tp1}${t.tp1Hit?' ✅':''} | TP3: ${t.tp3}${stuckTag}`;
     });
     await interaction.reply({ embeds: [{ color:0xD4E600,
-      description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}\n\n*Usa /cerrar id:<ID> para cerrar una manualmente si se queda colgada.*`,
+      description:`## ⚡ OPERACIONES ACTIVAS\n\n${lines.join('\n')}\n\n*Usa /cerrar id:<ID> para cerrar una manualmente si se queda colgada. ⚠️ = lleva más de ${STUCK_TRADE_HOURS}h abierta, revísala.*`,
       footer:{text:'DTC · Monitor en tiempo real'}, timestamp:new Date().toISOString() }] });
   }
 
@@ -474,7 +486,7 @@ function startPriceMonitor() {
        }
       }
     }
-  }, 60000);
+  }, PRICE_POLL_MS);
 }
 
 // ── Resumen semanal ───────────────────────────────────────────
@@ -528,7 +540,7 @@ app.post('/signal', async (req, res) => {
   try {
     if (req.query.key !== SECRET_KEY) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr } = req.body;
+    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price } = req.body;
     console.log(`📨 ${type} | ${asset} | ${direction}`);
 
     const isFuture  = asset==='MNQU26'||asset==='MNQ';
@@ -549,6 +561,18 @@ app.post('/signal', async (req, res) => {
     }
 
     else if (type === 'confirmed') {
+      // Guarda contra duplicados: si TradingView reenvía el mismo webhook
+      // (reintento de red, doble disparo de la alerta, etc.) no queremos
+      // mandar la señal dos veces ni abrir dos operaciones activas iguales.
+      const dedupKey = `${asset}_${direction}`;
+      const nowTs = Date.now();
+      const prevConfirmed = lastConfirmed[dedupKey];
+      if (prevConfirmed && prevConfirmed.entry === entry && (nowTs - prevConfirmed.time) < DUPLICATE_WINDOW_MIN*60000) {
+        console.log(`⏭️ Señal CONFIRMADA duplicada ignorada: ${dedupKey} @ ${entry}`);
+        return res.status(200).json({ ok:true, skipped:true, reason:'duplicate' });
+      }
+      lastConfirmed[dedupKey] = { entry, time: nowTs };
+
       lastPossible[asset] = 0;
       const isLong = direction==='LONG';
       const color  = isLong ? COLOR_LONG : COLOR_SHORT;
@@ -601,6 +625,80 @@ app.post('/signal', async (req, res) => {
         console.log(`📋 Trade guardado: ${id} | ${asset} ${direction}`);
         await syncActiveTradesToSheet();
       }
+    }
+
+    // ── Eventos de nivel tocado (TP1/TP2/TP3/SL) detectados por el propio
+    // Pine Script, con el precio real del gráfico — no dependen de ninguna
+    // API externa. Esto es lo que usa el Nasdaq, ya que Twelve Data no
+    // ofrece datos de índices en ningún plan.
+    else if (['tp1','tp2','tp3','sl'].includes(type)) {
+      const candidates = Object.values(activeTrades).filter(t => t.asset === asset);
+      let trade = null;
+      if (type === 'tp1') trade = candidates.find(t => !t.tp1Hit);
+      else if (type === 'tp2') trade = candidates.find(t => t.tp1Hit && !t.tp2Hit);
+      else if (type === 'tp3') trade = candidates.find(t => t.tp2Hit && !t.tp3Hit);
+      else if (type === 'sl')  trade = candidates.find(t => !t.slHit);
+
+      if (!trade) {
+        console.log(`⚠️ Evento ${type} recibido para ${asset} pero no hay operación activa que encaje.`);
+        return res.status(200).json({ ok:true, skipped:true, reason:'no_matching_trade' });
+      }
+
+      const priceF = price && price !== 'undefined' ? parseFloat(price) : null;
+      const tradeChannel = await client.channels.fetch(trade.channelId).catch(() => null);
+      if (!tradeChannel) return res.status(200).json({ ok:true, skipped:true, reason:'channel_not_found' });
+
+      if (type === 'sl') {
+        trade.slHit = true;
+        if (trade.tp1Hit) {
+          const rUsed = trade.tp3Hit ? trade.rr3 : (trade.tp2Hit ? trade.rr2 : trade.rr1);
+          await tradeChannel.send({ embeds: [{
+            color: COLOR_LOCKED,
+            description: `## 🔒 CIERRE ASEGURADO — ${asset} ${trade.direction}\n\n**Precio:** \`${priceF ?? trade.sl}\`\n\nYa había tocado ${trade.tp3Hit?'TP2':'TP1'} antes de volver al nivel de SL — cuenta como **operación GANADORA (+${rUsed}R)**, no como pérdida.\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+          }]});
+          await recordResult(trade, 'WIN', rUsed);
+        } else {
+          getStats(trade.asset).slHits++;
+          await tradeChannel.send({ embeds: [{
+            color: COLOR_SL,
+            description: `## 🛑 STOP LOSS TOCADO — ${asset} ${trade.direction}\n\n**Precio:** \`${priceF ?? trade.sl}\`\n**SL:** \`${trade.sl}\`\n\n*Operación cerrada con pérdida. −1R*\n*— Despierta Tu Capital (DTC)*`,
+            footer: { text: 'DTC · Gestión de riesgo' }, timestamp: new Date().toISOString()
+          }]});
+          await recordResult(trade, 'LOSS', -1);
+        }
+        delete activeTrades[trade.id]; await syncActiveTradesToSheet();
+      }
+      else if (type === 'tp1') {
+        trade.tp1Hit = true; getStats(trade.asset).tp1Hits++;
+        await tradeChannel.send({ embeds: [{
+          color: COLOR_TP1,
+          description: `## 🟢 TP1 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${priceF ?? trade.tp1}\`\n**TP1:** \`${trade.tp1}\`  *(RR 1:${trade.rr1})*\n\n✅ *A partir de aquí, aunque vuelva al SL, ya cuenta como GANADORA.*\n*— Despierta Tu Capital (DTC)*`,
+          footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+        }]});
+        await syncActiveTradesToSheet();
+      }
+      else if (type === 'tp2') {
+        trade.tp2Hit = true; getStats(trade.asset).tp2Hits++;
+        await tradeChannel.send({ embeds: [{
+          color: COLOR_TP2,
+          description: `## 🟡 TP2 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${priceF ?? trade.tp2}\`\n**TP2:** \`${trade.tp2}\`  *(RR 1:${trade.rr2})*\n\n✅ *Cierra otro parcial. SL en BE o TP1.*\n*— Despierta Tu Capital (DTC)*`,
+          footer: { text: 'DTC · Gestión de posición' }, timestamp: new Date().toISOString()
+        }]});
+        await syncActiveTradesToSheet();
+      }
+      else if (type === 'tp3') {
+        trade.tp3Hit = true; getStats(trade.asset).tp3Hits++;
+        await tradeChannel.send({ embeds: [{
+          color: COLOR_TP3,
+          description: `## 🏆 TP3 ALCANZADO — ${asset} ${trade.direction}\n\n**Precio:** \`${priceF ?? trade.tp3}\`\n**TP3:** \`${trade.tp3}\`  *(RR 1:${trade.rr3})*\n\n🎯 *Objetivo final completado.*\n*— Despierta Tu Capital (DTC)*`,
+          footer: { text: 'DTC · Objetivo completado' }, timestamp: new Date().toISOString()
+        }]});
+        await recordResult(trade, 'WIN', trade.rr3);
+        delete activeTrades[trade.id]; await syncActiveTradesToSheet();
+      }
+
+      return res.status(200).json({ ok:true });
     }
 
     res.status(200).json({ ok:true, active_trades:Object.keys(activeTrades).length });
