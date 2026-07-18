@@ -227,6 +227,9 @@ client.once('ready', async () => {
       .setDescription('Cerrar manualmente una operación activa colgada (no registra resultado ni escribe en el Sheet)')
       .addStringOption(opt => opt.setName('id').setDescription('ID de la operación, ej. trade_3 (mira /activas)').setRequired(true))
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName('cerrartodas')
+      .setDescription('Cerrar TODAS las operaciones activas de golpe (no registra resultado ni escribe en el Sheet)')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version:'10' }).setToken(DISCORD_TOKEN);
@@ -296,6 +299,18 @@ client.on('interactionCreate', async (interaction) => {
     delete activeTrades[id];
     await syncActiveTradesToSheet();
     await interaction.reply({ content: `✅ Operación \`${id}\` (${t.asset} ${t.direction}) cerrada manualmente. No se ha registrado ningún resultado ni se ha escrito nada en el Google Sheet.`, ephemeral:true });
+  }
+
+  else if (interaction.commandName === 'cerrartodas') {
+    const ids = Object.keys(activeTrades);
+    if (ids.length === 0) {
+      await interaction.reply({ content: '✅ No hay ninguna operación activa que cerrar.', ephemeral:true });
+      return;
+    }
+    const resumen = ids.map(id => `\`${id}\` — ${activeTrades[id].asset} ${activeTrades[id].direction}`).join('\n');
+    for (const id of ids) delete activeTrades[id];
+    await syncActiveTradesToSheet();
+    await interaction.reply({ content: `✅ Se han cerrado ${ids.length} operación(es) manualmente. No se ha registrado ningún resultado ni se ha escrito nada en el Google Sheet.\n\n${resumen}`, ephemeral:true });
   }
 });
 client.login(DISCORD_TOKEN);
