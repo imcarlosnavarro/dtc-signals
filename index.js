@@ -537,21 +537,28 @@ async function sendWeeklyReport() {
 // POST /signal
 // ═══════════════════════════════════════════════════════════════
 app.post('/signal', async (req, res) => {
-  try {
-    if (req.query.key !== SECRET_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (req.query.key !== SECRET_KEY) return res.status(401).json({ error: 'Unauthorized' });
 
+  // Respondemos YA — TradingView da timeout si el servidor tarda unos
+  // segundos en contestar (hemos visto "request took too long and timed
+  // out" en el log de alertas). Mandar a Discord + escribir en Sheets puede
+  // tardar más que eso, así que el procesamiento real sigue después, en
+  // segundo plano, ya desacoplado de la respuesta al webhook.
+  res.status(200).json({ ok: true, received: true });
+
+  try {
     const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price } = req.body;
     console.log(`📨 ${type} | ${asset} | ${direction}`);
 
     const isFuture  = asset==='MNQU26'||asset==='MNQ';
     const channelId = isFuture ? CHANNEL_FUTURE : CHANNEL_CFD;
     const channel   = await client.channels.fetch(channelId);
-    if (!channel) return res.status(500).json({ error: 'Canal no encontrado' });
+    if (!channel) { console.error('❌ Canal no encontrado'); return; }
 
     if (type === 'possible') {
       const now = Date.now();
       if ((now-(lastPossible[asset]||0))/60000 < COOLDOWN_MIN)
-        return res.status(200).json({ ok:true, skipped:true });
+        return;
       lastPossible[asset] = now;
       await channel.send({ embeds: [{
         color: COLOR_WARN,
@@ -569,7 +576,7 @@ app.post('/signal', async (req, res) => {
       const prevConfirmed = lastConfirmed[dedupKey];
       if (prevConfirmed && prevConfirmed.entry === entry && (nowTs - prevConfirmed.time) < DUPLICATE_WINDOW_MIN*60000) {
         console.log(`⏭️ Señal CONFIRMADA duplicada ignorada: ${dedupKey} @ ${entry}`);
-        return res.status(200).json({ ok:true, skipped:true, reason:'duplicate' });
+        return;
       }
       lastConfirmed[dedupKey] = { entry, time: nowTs };
 
@@ -641,12 +648,12 @@ app.post('/signal', async (req, res) => {
 
       if (!trade) {
         console.log(`⚠️ Evento ${type} recibido para ${asset} pero no hay operación activa que encaje.`);
-        return res.status(200).json({ ok:true, skipped:true, reason:'no_matching_trade' });
+        return;
       }
 
       const priceF = price && price !== 'undefined' ? parseFloat(price) : null;
       const tradeChannel = await client.channels.fetch(trade.channelId).catch(() => null);
-      if (!tradeChannel) return res.status(200).json({ ok:true, skipped:true, reason:'channel_not_found' });
+      if (!tradeChannel) { console.error('❌ Canal de la operación no encontrado'); return; }
 
       if (type === 'sl') {
         trade.slHit = true;
@@ -698,14 +705,11 @@ app.post('/signal', async (req, res) => {
         delete activeTrades[trade.id]; await syncActiveTradesToSheet();
       }
 
-      return res.status(200).json({ ok:true });
+      return;
     }
 
-    res.status(200).json({ ok:true, active_trades:Object.keys(activeTrades).length });
-
   } catch(err) {
-    console.error('❌ Error:', err.message);
-    res.status(500).json({ error:err.message });
+    console.error('❌ Error procesando /signal (respuesta ya enviada antes):', err.message);
   }
 });
 
