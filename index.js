@@ -5,6 +5,7 @@ app.use(express.json());
 const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;
 const CHANNEL_CFD    = process.env.CHANNEL_CFD;
 const CHANNEL_FUTURE = process.env.CHANNEL_FUTURE;
+const SIGNALS_ROLE_ID = process.env.SIGNALS_ROLE_ID; // ID del rol "DTC SIGNALS" en Discord, para el DM de bienvenida
 const SECRET_KEY     = process.env.SECRET_KEY || 'dtc2026';
 const TWELVE_KEY     = process.env.TWELVE_API_KEY || 'demo';
 const SHEET_ID       = process.env.SHEET_ID;
@@ -219,8 +220,46 @@ async function syncActiveTradesToSheet() {
 
 // ── Discord ──────────────────────────────────────────────────
 const { Client, GatewayIntentBits } = require('discord.js');
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers] });
 const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+
+// ── DM de bienvenida al recibir el rol DTC SIGNALS ──────────────
+const WELCOME_DM_MESSAGE = [
+  `📌 **AVISOS IMPORTANTES — LEE ESTO ANTES DE OPERAR CON LAS SEÑALES**`,
+  ``,
+  `Bienvenido/a a DTC Signals. Antes de empezar a operar, tómate un par de minutos para leer esto — te va a ahorrar problemas.`,
+  ``,
+  `🎥 **1. Mira el vídeo explicativo**`,
+  `Dentro de la app de Whop tienes un vídeo donde explico cómo funciona el algoritmo. Es importante verlo antes de operar, porque por ejemplo NAS100 no cotiza al mismo precio en futuros que en cuentas de fondeo (CFDs) — si no lo sabes, puedes confundirte con las entradas.`,
+  ``,
+  `⚠️ **2. Resultados pasados no garantizan resultados futuros**`,
+  `El algoritmo se reserva el derecho a tener alguna racha negativa, como cualquier sistema. El histórico está ahí y avala los resultados a largo plazo. Si justo cuando empiezas te toca un SL, no te agobies: esto se juzga a largo plazo, no en las primeras operaciones.`,
+  ``,
+  `🔒 **3. No copies el precio exacto que manda el bot**`,
+  `Por tu propia seguridad: no pongas la entrada, el SL y los TPs exactamente igual que los manda el algoritmo. Si todos operamos con el mismo precio exacto, algunas empresas de fondeo pueden interpretarlo como copytrading y bloquear cuentas. Sé inteligente: mete los valores ligeramente por encima o por debajo de lo que manda la señal, sin que eso cambie el resultado.`,
+  ``,
+  `💰 **4. Sistema de afiliados**`,
+  `Todos tenéis un enlace de afiliado en vuestro backoffice de Whop con el que ganáis un 20% recurrente cada mes de la facturación de las personas que traigáis. Si gestionas una comunidad grande y quieres hablar de condiciones especiales, escríbeme por privado.`,
+  ``,
+  `🚫 **5. Confidencialidad y uso indebido**`,
+  `El contenido educativo que se comparte aquí es privado. Cualquier uso indebido, reventa o difusión fuera de este servidor supondrá la cancelación inmediata del acceso (a esa persona y a sus afiliados), sin reembolso aunque queden días del mes por disfrutar, y se tomarán las medidas legales que correspondan por divulgación de información privada.`,
+  ``,
+  `Cualquier duda, para eso estamos. ¡Mucho éxito operando! 🚀`
+].join('\n');
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  try {
+    if (!SIGNALS_ROLE_ID) return;
+    const hadRole = oldMember.roles.cache.has(SIGNALS_ROLE_ID);
+    const hasRole = newMember.roles.cache.has(SIGNALS_ROLE_ID);
+    if (!hadRole && hasRole) {
+      await newMember.send({ content: WELCOME_DM_MESSAGE });
+      console.log(`✅ DM de bienvenida enviado a ${newMember.user.tag}`);
+    }
+  } catch (e) {
+    console.log(`⚠️ No se pudo enviar el DM de bienvenida a ${newMember.user.tag}: ${e.message}`);
+  }
+});
 
 client.once('ready', async () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
