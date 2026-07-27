@@ -263,9 +263,14 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
 client.once('ready', async () => {
   console.log(`✅ Bot conectado: ${client.user.tag}`);
-  console.log(`⏱️ Sondeo de precio cada ${PRICE_POLL_MS/1000}s`);
   await loadActiveTradesFromSheet();
-  startPriceMonitor();
+  // startPriceMonitor() DESACTIVADO: el TP/SL en tiempo real ahora lo maneja
+  // Pine Script (webhooks tp1/tp2/tp3/sl), para XAUUSD y MNQU26 por igual.
+  // Tenerlo activo a la vez que los webhooks de Pine provocaba que los dos
+  // sistemas compitieran por cerrar la misma operación: el que llegaba
+  // primero borraba el trade de activeTrades, y el otro se quedaba sin
+  // encontrar nada que cerrar (fallos silenciosos de SL/TP no avisados).
+  // startPriceMonitor();
   scheduleWeeklyReport();
 
   const commands = [
