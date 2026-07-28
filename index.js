@@ -709,15 +709,31 @@ app.post('/signal', async (req, res) => {
     // API externa. Esto es lo que usa el Nasdaq, ya que Twelve Data no
     // ofrece datos de índices en ningún plan.
     else if (['tp1','tp2','tp3','sl'].includes(type)) {
-      const candidates = Object.values(activeTrades).filter(t => t.asset === asset);
-      let trade = null;
-      if (type === 'tp1') trade = candidates.find(t => !t.tp1Hit);
-      else if (type === 'tp2') trade = candidates.find(t => t.tp1Hit && !t.tp2Hit);
-      else if (type === 'tp3') trade = candidates.find(t => t.tp2Hit && !t.tp3Hit);
-      else if (type === 'sl')  trade = candidates.find(t => !t.slHit);
+      // A veces TradingView manda la CONFIRMADA y un toque de TP/SL casi en
+      // el mismo instante (la vela siguiente a la entrada puede recibir su
+      // primer precio casi sin hueco de tiempo). Si este evento llega antes
+      // de que la CONFIRMADA haya terminado de guardar el trade en memoria,
+      // no encontraríamos nada — así que reintentamos unas cuantas veces
+      // con una pequeña espera antes de darlo por perdido.
+      const findTrade = () => {
+        const candidates = Object.values(activeTrades).filter(t => t.asset === asset);
+        if (type === 'tp1') return candidates.find(t => !t.tp1Hit);
+        if (type === 'tp2') return candidates.find(t => t.tp1Hit && !t.tp2Hit);
+        if (type === 'tp3') return candidates.find(t => t.tp2Hit && !t.tp3Hit);
+        if (type === 'sl')  return candidates.find(t => !t.slHit);
+        return null;
+      };
+
+      let trade = findTrade();
+      let retries = 0;
+      while (!trade && retries < 6) {
+        await new Promise(r => setTimeout(r, 500));
+        trade = findTrade();
+        retries++;
+      }
 
       if (!trade) {
-        console.log(`⚠️ Evento ${type} recibido para ${asset} pero no hay operación activa que encaje.`);
+        console.log(`⚠️ Evento ${type} recibido para ${asset} pero no hay operación activa que encaje (tras ${retries} reintentos).`);
         return;
       }
 
