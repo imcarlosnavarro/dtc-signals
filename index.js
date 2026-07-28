@@ -25,6 +25,15 @@ const lastConfirmed = {};
 const activeTrades = {};
 let tradeCounter = 0;
 
+// ── Cola de señales para el EA de MT5 ────────────────────────────
+// El EA de MetaTrader ya no calcula nada por su cuenta: pregunta aquí
+// periódicamente (WebRequest) si hay señales CONFIRMADAS nuevas, y abre
+// la operación con las mismas distancias de SL/TP (no los precios
+// absolutos, que no coinciden entre TradingView y el bróker de MT5).
+const mt5Signals = []; // { id, asset, direction, slDist, tp3Dist, ts }
+let mt5SignalId = 0;
+const MT5_QUEUE_MAX = 300; // recorta la cola para no crecer sin límite
+
 function emptyStats() {
   return { total:0, wins:0, losses:0, tp1Hits:0, tp2Hits:0, tp3Hits:0, slHits:0, pnlR:0, history:[], weeklyStats:{total:0,wins:0,losses:0,pnlR:0}, weeklyStart:new Date().toISOString() };
 }
@@ -675,6 +684,23 @@ app.post('/signal', async (req, res) => {
         };
         console.log(`📋 Trade guardado: ${id} | ${asset} ${direction}`);
         await syncActiveTradesToSheet();
+
+        // Encolar para el EA de MT5 — solo distancias, no precios absolutos
+        // (NAS100/XAUUSD en TradingView no coinciden en precio exacto con
+        // lo que ve tu bróker de MT5, así que el EA aplica estas distancias
+        // sobre SU PROPIO precio de entrada, no sobre el "entry" de aquí).
+        const entV = parseFloat(entry);
+        if (slF && tp3F) {
+          mt5SignalId++;
+          mt5Signals.push({
+            id: mt5SignalId, asset, direction,
+            slDist: Math.round(Math.abs(entV - slF) * 100) / 100,
+            tp3Dist: Math.round(Math.abs(tp3F - entV) * 100) / 100,
+            ts: Date.now()
+          });
+          if (mt5Signals.length > MT5_QUEUE_MAX) mt5Signals.splice(0, mt5Signals.length - MT5_QUEUE_MAX);
+          console.log(`🖥️ Señal encolada para MT5: #${mt5SignalId} ${asset} ${direction}`);
+        }
       }
     }
 
@@ -755,6 +781,22 @@ app.post('/signal', async (req, res) => {
   } catch(err) {
     console.error('❌ Error procesando /signal (respuesta ya enviada antes):', err.message);
   }
+});
+
+// ── GET /mt5/poll ─────────────────────────────────────────────
+// El EA de MetaTrader llama a esto cada pocos segundos preguntando por
+// señales CONFIRMADAS nuevas de un activo concreto. Solo devuelve
+// distancias de SL/TP3, nunca precios absolutos (ver comentario donde
+// se encola la señal más arriba).
+app.get('/mt5/poll', (req, res) => {
+  if (req.query.key !== SECRET_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const asset = req.query.asset;
+  const since = parseInt(req.query.since) || 0;
+  if (!asset) return res.status(400).json({ error: 'Falta parámetro asset' });
+
+  const signals = mt5Signals.filter(s => s.asset === asset && s.id > since);
+  const lastId = mt5Signals.length ? mt5Signals[mt5Signals.length - 1].id : since;
+  res.json({ ok: true, lastId, signals });
 });
 
 // ── GET /stats ────────────────────────────────────────────────
