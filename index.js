@@ -674,6 +674,19 @@ app.post('/signal', async (req, res) => {
         footer:{text:'DTC · Esto no es consejo de inversión'}, timestamp:new Date().toISOString() }]});
 
       if (slF || tp1F) {
+        // Pine solo sigue UNA operación activa a la vez por activo (la
+        // variable activeEntry se sobreescribe con cada nueva confirmada).
+        // El bot debe reflejar lo mismo: si ya había una operación de este
+        // activo sin resolver, ya no la sigue el Pine Script tampoco, así
+        // que la descartamos aquí en vez de dejarla acumulada para siempre
+        // (esto era lo que causaba operaciones "huérfanas" en /activas y
+        // cierres de TP/SL emparejados con la operación equivocada).
+        const stale = Object.values(activeTrades).filter(t => t.asset === asset);
+        for (const s of stale) {
+          console.log(`🗑️ Descartando operación anterior sin resolver de ${asset} (${s.id}) — Pine ya no la sigue, ha llegado una nueva confirmada`);
+          delete activeTrades[s.id];
+        }
+
         const id = `trade_${Date.now()}`;
         activeTrades[id] = {
           id, asset, direction, entry:parseFloat(entry),
