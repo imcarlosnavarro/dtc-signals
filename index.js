@@ -600,7 +600,7 @@ app.post('/signal', async (req, res) => {
   res.status(200).json({ ok: true, received: true });
 
   try {
-    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price } = req.body;
+    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price, lot } = req.body;
     console.log(`📨 ${type} | ${asset} | ${direction}`);
 
     const isFuture  = asset==='MNQU26'||asset==='MNQ';
@@ -656,6 +656,10 @@ app.post('/signal', async (req, res) => {
       const rr1F = parseFloat(rr1) || 0.75;
       const rr2F = parseFloat(rr2) || (isFuture?1.25:1.75);
       const rr3F = parseFloat(rr3) || parseFloat(rr) || (isFuture?1.8:2.74);
+      const lotF = lot && lot!=='undefined' ? parseFloat(lot) : null;
+      const lotLine = isFuture
+        ? (lotF ? `📦 **Contratos (cuenta $50.000, riesgo $500 ≈1%):** \`${lotF}\`` : null)
+        : (lotF ? `📦 **Lotes (cuenta $200.000, riesgo $2.000 ≈1%):** \`${lotF}\`` : null);
 
       const lines = [
         `## ✅ SEÑAL CONFIRMADA — ${asset} ${arrow} ${direction}`,``,
@@ -664,6 +668,7 @@ app.post('/signal', async (req, res) => {
         tp1F ? `🟢 **TP1:** \`${r(tp1F)}\`  *(RR 1:${rr1F})*` : null,
         tp2F ? `🟡 **TP2:** \`${r(tp2F)}\`  *(RR 1:${rr2F})*` : null,
         tp3F ? `🏆 **TP3:** \`${r(tp3F)}\`  *(RR 1:${rr3F})*` : null,
+        lotLine ? `\n${lotLine}` : null,
         score ? `\n⭐ **Score:** \`${score}/10\`` : null,
       ].filter(Boolean);
 
