@@ -709,7 +709,7 @@ app.post('/signal', async (req, res) => {
         // sobre SU PROPIO precio de entrada, no sobre el "entry" de aquí).
         const entV = parseFloat(entry);
         if (slF && tp3F) {
-          mt5SignalId++;
+          mt5SignalId = Math.max(Date.now(), mt5SignalId + 1);
           mt5Signals.push({
             id: mt5SignalId, asset, direction,
             slDist: Math.round(Math.abs(entV - slF) * 100) / 100,
