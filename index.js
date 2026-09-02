@@ -734,7 +734,7 @@ app.post('/signal', async (req, res) => {
       // no encontraríamos nada — así que reintentamos unas cuantas veces
       // con una pequeña espera antes de darlo por perdido.
       const findTrade = () => {
-        const candidates = Object.values(activeTrades).filter(t => t.asset === asset);
+        const MIN_TRADE_AGE_MS = 120000; const candidates = Object.values(activeTrades).filter(t => t.asset === asset && (Date.now() - new Date(t.openTime).getTime()) > MIN_TRADE_AGE_MS);
         if (type === 'tp1') return candidates.find(t => !t.tp1Hit);
         if (type === 'tp2') return candidates.find(t => t.tp1Hit && !t.tp2Hit);
         if (type === 'tp3') return candidates.find(t => t.tp2Hit && !t.tp3Hit);
