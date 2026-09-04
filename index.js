@@ -600,7 +600,7 @@ app.post('/signal', async (req, res) => {
   res.status(200).json({ ok: true, received: true });
 
   try {
-    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price, lot } = req.body;
+    const { type, asset, direction, entry, sl, tp, tp1, tp2, tp3, rr, rr1, rr2, rr3, score, atr, price, lot, lotEst } = req.body;
     console.log(`📨 ${type} | ${asset} | ${direction}`);
 
     const isFuture  = asset==='MNQU26'||asset==='MNQ';
@@ -608,17 +608,34 @@ app.post('/signal', async (req, res) => {
     const channel   = await client.channels.fetch(channelId);
     if (!channel) { console.error('❌ Canal no encontrado'); return; }
 
-    if (type === 'possible') {
-      const now = Date.now();
-      if ((now-(lastPossible[asset]||0))/60000 < COOLDOWN_MIN)
-        return;
-      lastPossible[asset] = now;
-      await channel.send({ embeds: [{
-        color: COLOR_WARN,
-        description: `## ⚠️ POSIBLE SEÑAL — ${asset}${direction?' '+direction:''}\n\nEsperando confirmación... no te precipites !!!`,
-        footer:{text:'Despierta Tu Capital (DTC)'}, timestamp:new Date().toISOString()
-      }]});
-    }
+if (type === 'possible') {
+        const now = Date.now();
+        if ((now-(lastPossible[asset]||0))/60000 < COOLDOWN_MIN)
+                  return;
+                lastPossible[asset] = now;
+
+        // SL previsto (en puntos) = ATR x multiplicador del activo, igual que
+        // calcula el propio Pine (slPoints = atr5 * i_slMult). No lo mandamos
+        // ya calculado desde TradingView porque el plot nuevo se quedaba sin
+        // placeholder (limite de ~14 plots nombrados por alerta en TradingView),
+        // asi que lo derivamos aqui a partir del ATR, que si viaja en un
+        // placeholder que ya funcionaba (ALERT_ATR).
+        const slM = isFuture ? 1.0 : 1.5;
+        const atrV = atr && atr!=='undefined' ? parseFloat(atr) : null;
+        const slPts = atrV!=null && !isNaN(atrV) ? Math.round(atrV*slM*10)/10 : null;
+        const lotV = (lotEst && lotEst!=='undefined') ? parseFloat(lotEst)
+                           : (lot && lot!=='undefined' ? parseFloat(lot) : null);
+
+        const extra = (slPts!=null || lotV!=null)
+          ? `\n\n📏 SL previsto: ${slPts!=null ? slPts+' pts' : '—'}   |   📦 Lote estimado: ${lotV!=null ? lotV : '—'}`
+                  : '';
+
+        await channel.send({ embeds: [{
+                  color: COLOR_WARN,
+                  description: `## ⚠️ POSIBLE SEÑAL — ${asset}${direction?' '+direction:''}\n\nEsperando confirmación... no te precipites !!!${extra}`,
+                  footer:{text:'Despierta Tu Capital (DTC)'}, timestamp:new Date().toISOString()
+        }]});
+}
 
     else if (type === 'confirmed') {
       // Guarda contra duplicados: si TradingView reenvía el mismo webhook
