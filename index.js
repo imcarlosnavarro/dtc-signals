@@ -280,7 +280,7 @@ client.once('ready', async () => {
   // primero borraba el trade de activeTrades, y el otro se quedaba sin
   // encontrar nada que cerrar (fallos silenciosos de SL/TP no avisados).
   // startPriceMonitor();
-  scheduleWeeklyReport();
+  // Resumen semanal automático desactivado (usa /resumen para lanzarlo a mano)
 
   const commands = [
     new SlashCommandBuilder().setName('stats').setDescription('Ver estadísticas de señales DTC'),
